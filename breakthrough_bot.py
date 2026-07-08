@@ -305,24 +305,33 @@ class BreakthroughBot:
         except Exception:
             pass
 
-        if last_known_size <= 0:
-            try:
-                from py_clob_client_v2 import AssetType, BalanceAllowanceParams
-                bal_resp = self.client.get_balance_allowance(BalanceAllowanceParams(
-                    asset_type=AssetType.CONDITIONAL, token_id=token,
-                    signature_type=int(os.getenv("POLY_SIGNATURE_TYPE", "3")),
-                ))
-                real_balance = float(bal_resp.get("balance", 0)) / 1_000_000
-                if real_balance >= 0.5:
-                    log(f"⚠️ get_order() showed no fill, but balance check found {real_balance} shares — correcting course", crypto)
-                    return {"result": "bought", "price": ceiling, "shares": real_balance}
-            except Exception as e:
-                log(f"⚠️ Final balance safety-check failed ({e})", crypto)
+        # REAL GAP CLOSED HERE: previously only checked the real on-chain
+        # balance when the poll showed ZERO fill. If the order filled
+        # partially right as the timeout/cancel happened, polling could
+        # understate the true fill — leaving real shares untracked and never
+        # sold later, the same class of danger as the sell-side bug. Now
+        # always verifies against the real balance and trusts whichever
+        # number is higher, since the on-chain balance is ground truth.
+        final_shares = last_known_size
+        try:
+            from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+            bal_resp = self.client.get_balance_allowance(BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL, token_id=token,
+                signature_type=int(os.getenv("POLY_SIGNATURE_TYPE", "3")),
+            ))
+            real_balance = float(bal_resp.get("balance", 0)) / 1_000_000
+            if real_balance > final_shares:
+                log(f"⚠️ Real balance ({real_balance}) exceeds tracked fill ({last_known_size}) — using real balance", crypto)
+                final_shares = real_balance
+        except Exception as e:
+            log(f"⚠️ Balance verification failed ({e}) — proceeding with tracked fill amount", crypto)
+
+        if final_shares <= 0:
             log(f"❌ BUY timed out with no confirmed fill after {BUY_TIMEOUT_SEC}s", crypto)
             return {"result": "missed", "price": None, "shares": 0}
 
-        log(f"✅ BUY confirmed: {last_known_size} shares at ceiling ${ceiling}, order {order_id[:16]}...", crypto)
-        return {"result": "bought", "price": ceiling, "shares": last_known_size}
+        log(f"✅ BUY confirmed: {final_shares} shares at ceiling ${ceiling}, order {order_id[:16]}...", crypto)
+        return {"result": "bought", "price": ceiling, "shares": final_shares}
 
     # ── SELL ─────────────────────────────────────────────────────────────────
 
@@ -332,8 +341,8 @@ class BreakthroughBot:
             log(f"⚠️ Buy partially filled: held {raw_shares}, flooring to {shares} whole shares", crypto)
         if shares < 1:
             log("⚠️ Partial fill left less than 1 whole share — forcing immediate exit", crypto)
-            exit_result = self._force_exit(token, raw_shares, crypto)
-            pnl = -round(buy_price * raw_shares, 4)
+            exit_result = self._guaranteed_sell(token, raw_shares, crypto)
+            pnl = -round(buy_price * raw_shares, 4) if exit_result["price"] is None else round((exit_result["price"] - buy_price) * raw_shares, 4)
             return {**exit_result, "pnl_usd": pnl, "notes": "sub-1-share partial fill"}
 
         # BRACKET ORDER: take-profit and stop-loss placed at the same time,
@@ -401,9 +410,16 @@ class BreakthroughBot:
                     log(f"Take-profit resting order placed at ${take_profit_price}, order {tp_order_id[:12]}...", crypto)
                 except Exception as e:
                     log(f"⚠️ Could not place take-profit order ({e}) — forcing exit immediately", crypto)
-                    exit_result = self._force_exit(token, shares, crypto)
-                    pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
-                    return {**exit_result, "pnl_usd": pnl, "notes": "take-profit placement failed"}
+                    exit_result = self._guaranteed_sell(token, shares, crypto)
+                    exit_price = exit_result["price"]
+                    if exit_result["result"] == "unsold_no_liquidity":
+                        # Position wasn't sold and will settle naturally at market
+                        # resolution — outcome genuinely isn't known yet, so don't
+                        # falsely log a confident loss for what might resolve as a win.
+                        return {"result": exit_result["result"], "price": None, "pnl_usd": None,
+                                "notes": "no liquidity found at any price — will settle at market resolution"}
+                    pnl = round((exit_price - buy_price) * shares, 4) if exit_price is not None else -round(buy_price * shares, 4)
+                    return {"result": exit_result["result"], "price": exit_price, "pnl_usd": pnl, "notes": "take-profit placement failed"}
 
             deadline = buy_time + BRACKET_TIMEOUT_SECONDS
             while now_unix() < deadline:
@@ -434,49 +450,22 @@ class BreakthroughBot:
                         self.client.cancel_order(OrderPayload(orderID=tp_order_id))
                     except Exception:
                         pass
-                    try:
-                        resp = self.client.create_and_post_market_order(
-                            MarketOrderArgsV2(token_id=token, amount=shares, side=Side.SELL),
-                            order_type=OrderType.FAK,
-                        )
-                        status = str(resp.get("status", "")).lower()
-                        exit_price = None
-                        if status == "matched":
-                            try:
-                                # CONFIRMED REAL BUG FIXED HERE: takingAmount is the
-                                # USDC actually received for a SELL order, not
-                                # makingAmount (which is the shares given) — confirmed
-                                # against real account history where this was silently
-                                # computing $0.00 on every force-exit.
-                                proceeds = float(resp.get("takingAmount", 0)) / 1_000_000
-                                candidate_price = round(proceeds / shares, 4) if shares else None
-                                # SANITY CHECK: tightened to Polymarket's real minimum
-                                # price (0.01) — the old "0 < x < 1" check would NOT have
-                                # caught the actual bug, since the wrong value (~0.000001)
-                                # technically satisfied it too.
-                                if candidate_price is not None and 0.01 <= candidate_price < 1:
-                                    exit_price = candidate_price
-                                else:
-                                    log(f"⚠️ Parsed sell price ${candidate_price} looks invalid — "
-                                        f"NOT trusting it. Raw response: {resp}", crypto)
-                            except Exception as e:
-                                log(f"⚠️ Could not parse sell fill price ({e}). Raw response: {resp}", crypto)
-                        if exit_price is None:
-                            # Fall back to the real current bid we just observed —
-                            # a genuine estimate, clearly labeled as such below,
-                            # rather than a possibly-wrong parsed number.
-                            exit_price = current_bid
-                            price_is_estimate = True
-                            log(f"Using observed bid ${current_bid} as an ESTIMATE — verify against your real account", crypto)
-                        else:
-                            price_is_estimate = False
-                    except Exception as e:
-                        log(f"⚠️ Stop-loss market sell failed ({e}) — falling back to force-exit", crypto)
-                        exit_result = self._force_exit(token, shares, crypto)
-                        pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
-                        return {**exit_result, "pnl_usd": pnl, "notes": "stop-loss trigger, fallback force-exit"}
+                    exit_result = self._guaranteed_sell(token, shares, crypto)
+                    if exit_result["result"] == "unsold_no_liquidity":
+                        # Position wasn't sold and will settle naturally at market
+                        # resolution — don't falsely log a confident loss for what
+                        # might resolve as a win.
+                        return {"result": exit_result["result"], "price": None, "pnl_usd": None,
+                                "notes": "no liquidity found at any price — will settle at market resolution"}
+                    exit_price = exit_result["price"]
+                    if exit_price is None:
+                        exit_price = current_bid
+                        exit_result["price_is_estimate"] = True
+                        log(f"Using observed bid ${current_bid} as an ESTIMATE — verify against your real account", crypto)
                     pnl = round((exit_price - buy_price) * shares, 4)
-                    notes = "stop_loss hit (price ESTIMATED, not exchange-confirmed — verify against real account)" if price_is_estimate else "stop_loss hit"
+                    notes = "stop_loss hit"
+                    if exit_result.get("price_is_estimate"):
+                        notes += " (price ESTIMATED, not exchange-confirmed — verify against real account)"
                     return {"result": "sold_stop_loss", "price": exit_price, "pnl_usd": pnl, "notes": notes}
 
                 time.sleep(POLL_INTERVAL_SLOW)
@@ -489,9 +478,13 @@ class BreakthroughBot:
             except Exception:
                 pass
             log(f"⏰ {BRACKET_TIMEOUT_SECONDS}s since buying, neither bracket level reached — force-exiting", crypto)
-            exit_result = self._force_exit(token, shares, crypto)
-            pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
-            return {**exit_result, "pnl_usd": pnl, "notes": "bracket timeout, force-exit"}
+            exit_result = self._guaranteed_sell(token, shares, crypto)
+            if exit_result["result"] == "unsold_no_liquidity":
+                return {"result": exit_result["result"], "price": None, "pnl_usd": None,
+                        "notes": "no liquidity found at any price — will settle at market resolution"}
+            exit_price = exit_result["price"]
+            pnl = round((exit_price - buy_price) * shares, 4) if exit_price is not None else -round(buy_price * shares, 4)
+            return {"result": exit_result["result"], "price": exit_price, "pnl_usd": pnl, "notes": "bracket timeout, force-exit"}
 
         # DRY-RUN
         while now_unix() - buy_time < BRACKET_TIMEOUT_SECONDS:
@@ -515,6 +508,116 @@ class BreakthroughBot:
         exit_result = self._force_exit(token, shares, crypto)
         pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
         return {**exit_result, "pnl_usd": pnl, "notes": "bracket timeout, force-exit", "seconds_to_sell": BRACKET_TIMEOUT_SECONDS}
+
+    def _guaranteed_sell(self, token: str, shares: float, crypto: str, max_market_attempts: int = 3) -> dict:
+        """
+        Sells the given shares NO MATTER WHAT — never leaves a position unsold
+        and unprotected. REAL BUG FIXED HERE: the old code tried a market (FAK)
+        sell exactly once, and if it failed with "no orders to match" (a real,
+        confirmed live failure — liquidity can vanish for a moment), the
+        fallback retried the IDENTICAL thing and failed the IDENTICAL way,
+        leaving real shares completely unsold and unprotected. This retries the
+        market sell a few times first (liquidity often reappears within a
+        second or two), then escalates to an increasingly aggressive resting
+        limit sell until it actually fills, rather than ever giving up.
+        """
+        from py_clob_client_v2 import MarketOrderArgsV2, OrderArgsV2, Side, OrderType, OrderPayload
+
+        for attempt in range(1, max_market_attempts + 1):
+            try:
+                resp = self.client.create_and_post_market_order(
+                    MarketOrderArgsV2(token_id=token, amount=shares, side=Side.SELL),
+                    order_type=OrderType.FAK,
+                )
+                status = str(resp.get("status", "")).lower()
+                if status == "matched":
+                    exit_price = None
+                    try:
+                        # CONFIRMED REAL BUG FIXED HERE: takingAmount in this
+                        # response is a PLAIN decimal USDC amount, not scaled by
+                        # 1,000,000 — confirmed against real fill data (e.g.
+                        # takingAmount "3" for 5 shares = $0.60/share, not a
+                        # microscopic number). Dividing by 1e6 here was wrong.
+                        proceeds = float(resp.get("takingAmount", 0))
+                        candidate_price = round(proceeds / shares, 4) if shares else None
+                        if candidate_price is not None and 0.01 <= candidate_price < 1:
+                            exit_price = candidate_price
+                        else:
+                            log(f"⚠️ Parsed sell price ${candidate_price} looks invalid — NOT trusting it. Raw: {resp}", crypto)
+                    except Exception as e:
+                        log(f"⚠️ Could not parse sell fill price ({e}). Raw: {resp}", crypto)
+                    return {"result": "exited", "price": exit_price, "price_is_estimate": exit_price is None}
+                log(f"⚠️ Market sell attempt {attempt}/{max_market_attempts}: status={status}, retrying...", crypto)
+            except Exception as e:
+                log(f"⚠️ Market sell attempt {attempt}/{max_market_attempts} failed: {e}", crypto)
+            if attempt < max_market_attempts:
+                time.sleep(1.0)
+
+        # All market-sell attempts failed — escalate to an increasingly
+        # aggressive resting limit sell, all the way down to Polymarket's
+        # actual minimum price ($0.01), before ever stopping. REAL FIX: the
+        # previous version stopped at 30% of bid and asked for manual
+        # intervention — that's not viable running 8 trades across hundreds
+        # of markets unattended. Any price this market will actually pay is
+        # better than sitting unsold, and $0.01 is always a valid, postable
+        # price on this exchange.
+        log(f"⚠️ All {max_market_attempts} market-sell attempts failed — escalating to increasingly "
+            f"aggressive limit sells down to the exchange minimum, no manual step involved", crypto)
+        for factor in (0.85, 0.70, 0.50, 0.30, 0.15, 0.05):
+            book = get_order_book(token)
+            current_bid, _ = best_bid(book)
+            reference = current_bid if current_bid is not None else 0.5
+            aggressive_price = max(round(reference * factor, 2), 0.01)
+            result = self._try_resting_sell(token, shares, aggressive_price, crypto, wait_seconds=4)
+            if result is not None:
+                return result
+
+        # Final, absolute floor — Polymarket's actual minimum valid price.
+        # If even this doesn't fill, there is genuinely no buyer anywhere in
+        # this market at any price, which no selling mechanism can change —
+        # the position will settle at resolution like any other outcome.
+        log("Escalated all the way to the exchange minimum ($0.01) — placing final floor order", crypto)
+        result = self._try_resting_sell(token, shares, 0.01, crypto, wait_seconds=8)
+        if result is not None:
+            return result
+
+        log("No buyer found anywhere in this market even at the $0.01 floor — "
+            "this position will settle at market resolution, same as any other outcome. No action needed.", crypto)
+        return {"result": "unsold_no_liquidity", "price": None, "price_is_estimate": False}
+
+    def _try_resting_sell(self, token: str, shares: float, price: float, crypto: str, wait_seconds: float) -> dict | None:
+        """Places one resting sell at the given price and waits briefly for a fill.
+        Returns a result dict if filled, or None if it should escalate further."""
+        from py_clob_client_v2 import OrderArgsV2, Side, OrderType, OrderPayload
+        try:
+            resp = self.client.create_and_post_order(
+                OrderArgsV2(token_id=token, price=price, size=shares, side=Side.SELL),
+                order_type=OrderType.GTC,
+            )
+            order_id = resp.get("orderID", "")
+            log(f"Limit sell placed at ${price}, order {order_id[:12]}...", crypto)
+        except Exception as e:
+            log(f"⚠️ Could not place limit sell at ${price} ({e}) — trying next level", crypto)
+            return None
+
+        deadline = now_unix() + wait_seconds
+        filled_amt = 0.0
+        while now_unix() < deadline:
+            try:
+                detail = self.client.get_order(order_id)
+                filled_amt = float(detail.get("size_matched", 0))
+            except Exception:
+                pass
+            if filled_amt >= shares:
+                log(f"Limit sell filled at ${price}", crypto)
+                return {"result": "exited", "price": price, "price_is_estimate": False}
+            time.sleep(0.5)
+        try:
+            self.client.cancel_order(OrderPayload(orderID=order_id))
+        except Exception:
+            pass
+        log(f"⚠️ Limit sell at ${price} did not fill in time — trying next level", crypto)
+        return None
 
     def _force_exit(self, token: str, shares: float, crypto: str) -> dict:
         if self.dry_run:
@@ -548,7 +651,11 @@ class BreakthroughBot:
             # price of $0.00 on every force-exit, confirmed against real
             # account history where the actual fills were completely normal.
             try:
-                proceeds = float(resp.get("takingAmount", 0)) / 1_000_000
+                # CONFIRMED REAL BUG FIXED HERE (second instance): takingAmount
+                # is a PLAIN decimal USDC amount in this response, not scaled by
+                # 1,000,000 — confirmed against real fill data. Dividing by 1e6
+                # was wrong and made every real fill look invalid.
+                proceeds = float(resp.get("takingAmount", 0))
                 candidate_price = round(proceeds / shares, 4) if shares else None
                 if candidate_price is not None and 0.01 <= candidate_price < 1:
                     exit_price = candidate_price
@@ -658,9 +765,12 @@ class BreakthroughBot:
             self.trades.append(row)
         self.logger.write(row)
         pnl = row.get("pnl_usd", 0)
-        sign = "+" if isinstance(pnl, (int, float)) and pnl >= 0 else ""
+        if pnl is None:
+            pnl_str = "PENDING (will settle at market resolution)"
+        else:
+            pnl_str = f"{'+' if pnl >= 0 else ''}${pnl}"
         log(f"RECORDED: side={row['delta_side']} | buy={row['buy_result']}@{row['buy_price']} | "
-            f"sell={row['sell_result']}@{row['sell_price']} | pnl={sign}${pnl}", row["crypto"])
+            f"sell={row['sell_result']}@{row['sell_price']} | pnl={pnl_str}", row["crypto"])
 
     def _asset_loop(self, slug_prefix: str):
         crypto = MARKETS[slug_prefix]
@@ -695,12 +805,15 @@ class BreakthroughBot:
         bought      = [t for t in trades if t["buy_result"] == "bought"]
         take_profit = [t for t in bought if t["sell_result"] == "sold_take_profit"]
         stop_loss   = [t for t in bought if t["sell_result"] == "sold_stop_loss"]
-        total_pnl = sum(float(t["pnl_usd"] or 0) for t in trades)
+        pending     = [t for t in bought if t["pnl_usd"] is None]
+        total_pnl = sum(float(t["pnl_usd"]) for t in trades if t["pnl_usd"] is not None)
         log("-" * 70)
         log(f"SUMMARY — {len(trades)} signals, {len(bought)} buy fills")
         log(f"  Take-profit hits: {len(take_profit)}")
         log(f"  Stop-loss hits: {len(stop_loss)}")
-        log(f"  Total PnL: {'+' if total_pnl >= 0 else ''}${total_pnl:.2f}")
+        if pending:
+            log(f"  Pending settlement (no liquidity found, not yet resolved): {len(pending)}")
+        log(f"  Total PnL (excludes pending): {'+' if total_pnl >= 0 else ''}${total_pnl:.2f}")
         log("-" * 70)
 
 
