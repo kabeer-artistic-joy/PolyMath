@@ -43,7 +43,8 @@ pip install -r requirements.txt
 ### **4. Set Up Environment Variables**
 
 ```bash
-cp .env.example .env
+copy env.example .env
+notepad .env
 ```
 
 Edit `.env` and fill in your keys (only required for `--live` mode).
