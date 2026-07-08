@@ -27,7 +27,7 @@ cd PolyMath
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate
+.venv\Scripts\activate
 ```
 
 ---
