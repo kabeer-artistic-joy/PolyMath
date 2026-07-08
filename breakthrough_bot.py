@@ -810,8 +810,29 @@ class BreakthroughBot:
 
     def _asset_loop(self, slug_prefix: str):
         crypto = MARKETS[slug_prefix]
+        # REAL BUG FIXED HERE: recomputing "next_window_start(now)" after each
+        # window finished processing could SKIP an entire window. If the loop
+        # took even a few seconds of processing overhead past a window's
+        # close, by the time it asked "what's the next window", it was
+        # already a few seconds INSIDE the next one — so next_window_start
+        # correctly answered with the window AFTER that, silently dropping
+        # the one that should have started. Confirmed live: a 5-minute
+        # window never started at all. Fix: track windows sequentially
+        # (previous start + 300) instead of recomputing from "now" each time
+        # — only the very first window ever uses next_window_start().
+        next_start_ts = None
         while not self.stop_event.is_set():
-            start_ts = next_window_start(now_unix())
+            if next_start_ts is None:
+                start_ts = next_window_start(now_unix())
+            else:
+                start_ts = next_start_ts
+                if now_unix() > start_ts + 30:
+                    # We're badly behind (more than 30s late) — likely a long
+                    # stall or restart. Re-sync to the real next window rather
+                    # than trying to "catch up" on windows that already closed.
+                    log(f"⚠️ Running {int(now_unix() - start_ts)}s behind schedule — re-syncing to the current window", crypto)
+                    start_ts = next_window_start(now_unix())
+
             while now_unix() < start_ts and not self.stop_event.is_set():
                 time.sleep(1)
             if self.stop_event.is_set():
@@ -821,7 +842,7 @@ class BreakthroughBot:
                 self._monitor_window(slug_prefix, start_ts)
             except Exception as e:
                 log(f"⚠️ Unhandled error this window: {e}", crypto)
-            time.sleep(2)
+            next_start_ts = start_ts + 300
 
     def run(self):
         threads = [threading.Thread(target=self._asset_loop, args=(prefix,), daemon=True) for prefix in MARKETS]
