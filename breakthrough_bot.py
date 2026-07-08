@@ -16,7 +16,8 @@ project, not speculative ideas layered back in:
     just enough to actually get filled.
   - Sell mechanics reuse the proven resting-order pattern: instantly rest a
     sell at entry + PROFIT_MARGIN the moment a buy confirms, force-exit if
-    bracket order (take-profit and stop-loss placed simultaneously) — the ultimate backstop is BRACKET_TIMEOUT_SECONDS.
+    bracket order (take-profit and stop-loss placed simultaneously) — the ultimate backstop is tied to the
+    window's actual close time — a fixed BRACKET_TIMEOUT_SECONDS delay after buying instead.
   - Whole-share flooring, the balance-safety fallback, and the crash-safety
     None-price guard are all carried over unchanged.
 
@@ -78,8 +79,9 @@ STOP_LOSS_MARGIN   = 0.06        # WIDENED from 0.02 — real data showed severa
                                     # rate, not higher profitability) — widening the stop specifically targets
                                     # spread noise, not the ratio itself.
                                     # instead of riding it down further
-BRACKET_TIMEOUT_SECONDS = 60     # ultimate backstop only — if NEITHER bracket level is reached this long
-                                    # after buying, force-exit at whatever price is available
+BRACKET_TIMEOUT_SECONDS = 80     # ultimate backstop only — raised from 60 per explicit request, to give a
+                                    # still-favorably-moving position more room before being cut off. Reverted
+                                    # to a fixed post-buy timer (not tied to window close) per explicit request.
 
 MAX_TRADES_PER_WINDOW = 8        # raised from 6 per explicit request
 MONITOR_INTERVAL      = 1.0      # how often to check for a new entry opportunity throughout the window
@@ -236,7 +238,7 @@ class BreakthroughBot:
             + (" | ⚠️ INVERT_SIGNAL=True — betting AGAINST the delta signal (test mode)" if INVERT_SIGNAL else ""))
         log(f"Buy: observed price + ${BUY_CEILING_BUFFER} buffer (no fixed ceiling) | timeout {BUY_TIMEOUT_SEC}s")
         log(f"Sell: bracket order — take-profit entry+${PROFIT_MARGIN} | stop-loss entry-${STOP_LOSS_MARGIN} | "
-            f"backstop timeout {BRACKET_TIMEOUT_SECONDS}s | "
+            f"backstop: {BRACKET_TIMEOUT_SECONDS}s after buying | "
             f"max {MAX_TRADES_PER_WINDOW} trades/window")
         log(f"Trade log: {self.logger.path}")
         log("=" * 70)
@@ -324,7 +326,7 @@ class BreakthroughBot:
 
     # ── SELL ─────────────────────────────────────────────────────────────────
 
-    def _watch_for_sell(self, token: str, buy_price: float, raw_shares: float, crypto: str) -> dict:
+    def _watch_for_sell(self, token: str, buy_price: float, raw_shares: float, crypto: str, close_ts: float) -> dict:
         shares = int(raw_shares)
         if shares != raw_shares:
             log(f"⚠️ Buy partially filled: held {raw_shares}, flooring to {shares} whole shares", crypto)
@@ -339,10 +341,27 @@ class BreakthroughBot:
         # the outcome — a real win capped losses, or a small, controlled
         # loss if the market moves the other way. This replaces the old
         # single-target + blind-timeout design.
-        take_profit_price = round(buy_price + PROFIT_MARGIN, 4)
-        stop_loss_price   = round(buy_price - STOP_LOSS_MARGIN, 4)
-        log(f"Bracket: take-profit ${take_profit_price} (+${PROFIT_MARGIN}) | "
-            f"stop-loss ${stop_loss_price} (-${STOP_LOSS_MARGIN})", crypto)
+        # REAL BUG FIXED HERE: Polymarket only accepts prices between $0.01 and
+        # $0.99. Any entry above $0.84 made the full +$0.15 take-profit target
+        # invalid (>$0.99) — confirmed live: this caused repeated "could not
+        # place take-profit" failures and immediate force-exits exactly when
+        # buying into a strongly-moving, already-high-priced market. Clamping
+        # gives these trades a real (if smaller) chance at the target instead
+        # of guaranteeing an instant exit.
+        take_profit_price = min(round(buy_price + PROFIT_MARGIN, 4), 0.99)
+        stop_loss_price   = max(round(buy_price - STOP_LOSS_MARGIN, 4), 0.01)
+
+        if take_profit_price <= buy_price:
+            # Buy price itself was already too close to $0.99 — there's no
+            # valid room left for ANY take-profit above entry. No point
+            # placing an order that can't win; go straight to the stop-loss
+            # watch only, relying on the backstop if price never drops either.
+            log(f"⚠️ Buy price ${buy_price} leaves no room for a take-profit (clamped max is $0.99) — "
+                f"skipping take-profit, watching stop-loss only", crypto)
+            take_profit_price = None
+
+        log(f"Bracket: take-profit {'$'+str(take_profit_price) if take_profit_price else 'N/A (no room)'} "
+            f"(+${PROFIT_MARGIN}) | stop-loss ${stop_loss_price} (-${STOP_LOSS_MARGIN})", crypto)
         buy_time = now_unix()
 
         if not self.dry_run:
@@ -372,35 +391,37 @@ class BreakthroughBot:
             # we watch the real price ourselves and only submit a real sell
             # the INSTANT it actually reaches the stop level — never before.
             tp_order_id = None
-            try:
-                tp_resp = self.client.create_and_post_order(
-                    OrderArgsV2(token_id=token, price=take_profit_price, size=shares, side=Side.SELL),
-                    order_type=OrderType.GTC,
-                )
-                tp_order_id = tp_resp.get("orderID", "")
-                log(f"Take-profit resting order placed at ${take_profit_price}, order {tp_order_id[:12]}...", crypto)
-            except Exception as e:
-                log(f"⚠️ Could not place take-profit order ({e}) — forcing exit immediately", crypto)
-                exit_result = self._force_exit(token, shares, crypto)
-                pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
-                return {**exit_result, "pnl_usd": pnl, "notes": "take-profit placement failed"}
+            if take_profit_price is not None:
+                try:
+                    tp_resp = self.client.create_and_post_order(
+                        OrderArgsV2(token_id=token, price=take_profit_price, size=shares, side=Side.SELL),
+                        order_type=OrderType.GTC,
+                    )
+                    tp_order_id = tp_resp.get("orderID", "")
+                    log(f"Take-profit resting order placed at ${take_profit_price}, order {tp_order_id[:12]}...", crypto)
+                except Exception as e:
+                    log(f"⚠️ Could not place take-profit order ({e}) — forcing exit immediately", crypto)
+                    exit_result = self._force_exit(token, shares, crypto)
+                    pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
+                    return {**exit_result, "pnl_usd": pnl, "notes": "take-profit placement failed"}
 
             deadline = buy_time + BRACKET_TIMEOUT_SECONDS
             while now_unix() < deadline:
-                # Check take-profit fill
-                try:
-                    detail = self.client.get_order(tp_order_id)
-                except Exception:
-                    detail = None
-                if detail is not None:
+                # Check take-profit fill (only if one was actually placed)
+                if tp_order_id is not None:
                     try:
-                        filled = float(detail.get("size_matched", 0))
-                    except (TypeError, ValueError):
-                        filled = 0
-                    if filled >= shares:
-                        pnl = round((take_profit_price - buy_price) * shares, 4)
-                        return {"result": "sold_take_profit", "price": take_profit_price, "pnl_usd": pnl,
-                                "notes": "take_profit hit"}
+                        detail = self.client.get_order(tp_order_id)
+                    except Exception:
+                        detail = None
+                    if detail is not None:
+                        try:
+                            filled = float(detail.get("size_matched", 0))
+                        except (TypeError, ValueError):
+                            filled = 0
+                        if filled >= shares:
+                            pnl = round((take_profit_price - buy_price) * shares, 4)
+                            return {"result": "sold_take_profit", "price": take_profit_price, "pnl_usd": pnl,
+                                    "notes": "take_profit hit"}
 
                 # Check the REAL current price against the stop-loss level —
                 # only submit a real sell order once it's actually been reached.
@@ -422,16 +443,18 @@ class BreakthroughBot:
                         exit_price = None
                         if status == "matched":
                             try:
-                                cost = float(resp.get("makingAmount", 0)) / 1_000_000
-                                candidate_price = round(cost / shares, 4) if shares else None
-                                # SANITY CHECK: this field's meaning for a SELL order is
-                                # NOT independently confirmed (only validated for BUY
-                                # orders elsewhere in this project). A valid price here
-                                # must be between 0 and 1. If it isn't, don't trust it —
-                                # log the raw response so this can be verified against
-                                # the real account rather than silently recording a
-                                # wrong number.
-                                if candidate_price is not None and 0 < candidate_price < 1:
+                                # CONFIRMED REAL BUG FIXED HERE: takingAmount is the
+                                # USDC actually received for a SELL order, not
+                                # makingAmount (which is the shares given) — confirmed
+                                # against real account history where this was silently
+                                # computing $0.00 on every force-exit.
+                                proceeds = float(resp.get("takingAmount", 0)) / 1_000_000
+                                candidate_price = round(proceeds / shares, 4) if shares else None
+                                # SANITY CHECK: tightened to Polymarket's real minimum
+                                # price (0.01) — the old "0 < x < 1" check would NOT have
+                                # caught the actual bug, since the wrong value (~0.000001)
+                                # technically satisfied it too.
+                                if candidate_price is not None and 0.01 <= candidate_price < 1:
                                     exit_price = candidate_price
                                 else:
                                     log(f"⚠️ Parsed sell price ${candidate_price} looks invalid — "
@@ -465,7 +488,7 @@ class BreakthroughBot:
                 self.client.cancel_order(OrderPayload(orderID=tp_order_id))
             except Exception:
                 pass
-            log(f"⏰ Neither bracket level reached within {BRACKET_TIMEOUT_SECONDS}s — force-exiting", crypto)
+            log(f"⏰ {BRACKET_TIMEOUT_SECONDS}s since buying, neither bracket level reached — force-exiting", crypto)
             exit_result = self._force_exit(token, shares, crypto)
             pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
             return {**exit_result, "pnl_usd": pnl, "notes": "bracket timeout, force-exit"}
@@ -476,7 +499,7 @@ class BreakthroughBot:
             bid_price, bid_size = best_bid(book)
             if bid_price is not None and bid_size >= shares:
                 elapsed = round(now_unix() - buy_time, 1)
-                if bid_price >= take_profit_price:
+                if take_profit_price is not None and bid_price >= take_profit_price:
                     log(f"[DRY] Take-profit hit: bid ${bid_price:.3f} at {elapsed}s", crypto)
                     pnl = round((take_profit_price - buy_price) * shares, 4)
                     return {"result": "sold_take_profit", "price": take_profit_price, "pnl_usd": pnl,
@@ -488,7 +511,7 @@ class BreakthroughBot:
                             "notes": "stop_loss hit", "seconds_to_sell": elapsed}
             time.sleep(POLL_INTERVAL_SLOW)
 
-        log(f"⏰ Neither bracket level reached within {BRACKET_TIMEOUT_SECONDS}s — force-exiting at best price", crypto)
+        log(f"⏰ {BRACKET_TIMEOUT_SECONDS}s since buying, neither bracket level reached — force-exiting at best price", crypto)
         exit_result = self._force_exit(token, shares, crypto)
         pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
         return {**exit_result, "pnl_usd": pnl, "notes": "bracket timeout, force-exit", "seconds_to_sell": BRACKET_TIMEOUT_SECONDS}
@@ -504,6 +527,10 @@ class BreakthroughBot:
             return {"result": "exited", "price": price}
 
         from py_clob_client_v2 import MarketOrderArgsV2, Side, OrderType
+        # Capture the current best bid BEFORE selling, so we have a real
+        # fallback estimate if the response parsing below doesn't work.
+        book_before = get_order_book(token)
+        observed_bid_before, _ = best_bid(book_before)
         try:
             resp = self.client.create_and_post_market_order(
                 MarketOrderArgsV2(token_id=token, amount=shares, side=Side.SELL),
@@ -514,11 +541,26 @@ class BreakthroughBot:
             return {"result": "error", "price": None}
         status = str(resp.get("status", "")).lower()
         if status == "matched":
+            exit_price = None
+            # CONFIRMED REAL BUG FIXED HERE: for a SELL order, makingAmount is
+            # the shares GIVEN, not USDC received — takingAmount is what you
+            # actually get paid. Using makingAmount here silently computed a
+            # price of $0.00 on every force-exit, confirmed against real
+            # account history where the actual fills were completely normal.
             try:
-                cost = float(resp.get("makingAmount", 0)) / 1_000_000
-                exit_price = round(cost / shares, 4) if shares else None
-            except Exception:
-                exit_price = None
+                proceeds = float(resp.get("takingAmount", 0)) / 1_000_000
+                candidate_price = round(proceeds / shares, 4) if shares else None
+                if candidate_price is not None and 0.01 <= candidate_price < 1:
+                    exit_price = candidate_price
+                else:
+                    log(f"⚠️ Parsed force-exit price ${candidate_price} looks invalid — "
+                        f"NOT trusting it. Raw response: {resp}", crypto)
+            except Exception as e:
+                log(f"⚠️ Could not parse force-exit fill price ({e}). Raw response: {resp}", crypto)
+            if exit_price is None:
+                exit_price = observed_bid_before
+                log(f"Using observed bid ${observed_bid_before} as an ESTIMATE for this force-exit — "
+                    f"verify against your real account", crypto)
             return {"result": "exited", "price": exit_price}
         return {"result": "unmatched", "price": None}
 
@@ -602,7 +644,7 @@ class BreakthroughBot:
                 time.sleep(MONITOR_INTERVAL)
                 continue
 
-            sell_info = self._watch_for_sell(token, buy_info["price"], buy_info["shares"], crypto)
+            sell_info = self._watch_for_sell(token, buy_info["price"], buy_info["shares"], crypto, close_ts)
             row.update({
                 "sell_result": sell_info["result"], "sell_price": sell_info["price"],
                 "seconds_to_sell": sell_info.get("seconds_to_sell", ""),
