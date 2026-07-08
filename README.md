@@ -4,8 +4,8 @@
 
 *USAGE*
 
-python breakthrough_bot.py --dry-run
-python breakthrough_bot.py --live
+- python breakthrough_bot.py --dry-run
+- python breakthrough_bot.py --live
 
 ---
 
