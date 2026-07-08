@@ -1,28 +1,49 @@
-*POLYMATH -- BOT*
+# **POLYMATH -- BOT**
 
 ---
 
-*USAGE*
+## **Usage**
 
-- python breakthrough_bot.py --dry-run
-- python breakthrough_bot.py --live
+```bash
+python breakthrough_bot.py --dry-run
+python breakthrough_bot.py --live
+```
 
 ---
 
-*INSTALATION*
+## **Installation**
 
-1. CLONE THE REPO --
+### **1. Clone the Repository**
+
+```bash
 cd C:\Users\Administrator
 git clone https://github.com/kabeer-artistic-joy/PolyMath.git
 cd PolyMath
+```
 
-2. CREATE A VIRTUAL ENV
+---
+
+### **2. Create a Virtual Environment**
+
+```bash
 python -m venv .venv
 source .venv/bin/activate
+```
 
-3. INSTALL DEPENDENCIES
+---
+
+### **3. Install Dependencies**
+
+```bash
 pip install -r requirements.txt
+```
 
-4. SET UP ENVIRONMENT VARIABLES
+---
+
+### **4. Set Up Environment Variables**
+
+```bash
 cp .env.example .env
--- Edit .env and fill in your keys (only required for --live mode)
+```
+
+Edit `.env` and fill in your keys (only required for `--live` mode).
