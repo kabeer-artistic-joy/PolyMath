@@ -86,7 +86,11 @@ BRACKET_TIMEOUT_SECONDS = 80     # ultimate backstop only — raised from 60 per
 MAX_TRADES_PER_WINDOW = 8        # raised from 6 per explicit request
 MONITOR_INTERVAL      = 1.0      # how often to check for a new entry opportunity throughout the window
 
-POLL_INTERVAL_SLOW = 0.5
+POLL_INTERVAL_SLOW = 0.15  # TIGHTENED from 0.5s — real data showed stop-loss overshooting its
+                             # target by up to $0.26 during fast price moves, since the price can
+                             # fall well past the threshold between two polls. Faster polling
+                             # doesn't eliminate this (no native exchange stop-order exists here,
+                             # confirmed earlier), but it meaningfully shrinks the gap.
 
 # ─── UTILITIES ───────────────────────────────────────────────────────────────
 
@@ -375,13 +379,37 @@ class BreakthroughBot:
 
         if not self.dry_run:
             from py_clob_client_v2 import AssetType, BalanceAllowanceParams
-            try:
-                self.client.update_balance_allowance(BalanceAllowanceParams(
-                    asset_type=AssetType.CONDITIONAL, token_id=token,
-                    signature_type=int(os.getenv("POLY_SIGNATURE_TYPE", "3")),
-                ))
-            except Exception as e:
-                log(f"⚠️ Could not sync conditional balance ({e})", crypto)
+
+            # REAL BUG FIXED HERE: confirmed live — a buy can show as
+            # "matched" via the order API before the underlying on-chain
+            # settlement fully completes. Trying to place the take-profit
+            # order immediately can then fail with "balance: 0" even though
+            # the buy genuinely succeeded, forcing an unnecessary early exit
+            # (confirmed: this cost a real trade that could have reached its
+            # $0.78 take-profit target instead of exiting at a loss). Actively
+            # wait for the real balance to reflect the shares, up to 5s,
+            # instead of assuming it's available instantly.
+            balance_confirmed = False
+            wait_deadline = now_unix() + 5
+            while now_unix() < wait_deadline:
+                try:
+                    self.client.update_balance_allowance(BalanceAllowanceParams(
+                        asset_type=AssetType.CONDITIONAL, token_id=token,
+                        signature_type=int(os.getenv("POLY_SIGNATURE_TYPE", "3")),
+                    ))
+                    bal_resp = self.client.get_balance_allowance(BalanceAllowanceParams(
+                        asset_type=AssetType.CONDITIONAL, token_id=token,
+                        signature_type=int(os.getenv("POLY_SIGNATURE_TYPE", "3")),
+                    ))
+                    real_balance = float(bal_resp.get("balance", 0)) / 1_000_000
+                    if real_balance >= shares - 0.01:
+                        balance_confirmed = True
+                        break
+                except Exception as e:
+                    log(f"⚠️ Balance check failed ({e}), retrying...", crypto)
+                time.sleep(0.5)
+            if not balance_confirmed:
+                log(f"⚠️ Balance still not settled after 5s — proceeding anyway, take-profit placement may fail", crypto)
 
             from py_clob_client_v2 import OrderArgsV2, MarketOrderArgsV2, Side, OrderType, OrderPayload
 
@@ -485,7 +513,7 @@ class BreakthroughBot:
         pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
         return {**exit_result, "pnl_usd": pnl, "notes": "bracket timeout, force-exit", "seconds_to_sell": BRACKET_TIMEOUT_SECONDS}
 
-    def _guaranteed_sell(self, token: str, shares: float, crypto: str, max_market_attempts: int = 3) -> dict:
+    def _guaranteed_sell(self, token: str, shares: float, crypto: str, max_market_attempts: int = 2) -> dict:
         """
         Sells the given shares NO MATTER WHAT — never leaves a position unsold
         and unprotected. REAL BUG FIXED HERE: the old code tried a market (FAK)
@@ -493,9 +521,13 @@ class BreakthroughBot:
         confirmed live failure — liquidity can vanish for a moment), the
         fallback retried the IDENTICAL thing and failed the IDENTICAL way,
         leaving real shares completely unsold and unprotected. This retries the
-        market sell a few times first (liquidity often reappears within a
-        second or two), then escalates to an increasingly aggressive resting
-        limit sell until it actually fills, rather than ever giving up.
+        market sell a couple times first (liquidity often reappears within a
+        second), then escalates to an increasingly aggressive resting limit
+        sell until it actually fills, rather than ever giving up. TIGHTENED:
+        real data showed stop-loss fills overshooting their target by up to
+        $0.26 during fast price moves — every second spent retrying here is
+        a second the price keeps moving further against the position, so
+        retries and delays are kept as short as still reasonably useful.
         """
         from py_clob_client_v2 import MarketOrderArgsV2, OrderArgsV2, Side, OrderType, OrderPayload
 
@@ -527,7 +559,7 @@ class BreakthroughBot:
             except Exception as e:
                 log(f"⚠️ Market sell attempt {attempt}/{max_market_attempts} failed: {e}", crypto)
             if attempt < max_market_attempts:
-                time.sleep(1.0)
+                time.sleep(0.3)
 
         # All market-sell attempts failed — escalate to an increasingly
         # aggressive resting limit sell, all the way down to Polymarket's
@@ -557,7 +589,7 @@ class BreakthroughBot:
             current_bid, _ = best_bid(book)
             reference = current_bid if current_bid is not None else 0.5
             aggressive_price = max(round(reference * factor, 2), 0.01)
-            attempt_result = self._try_resting_sell(token, remaining, aggressive_price, crypto, wait_seconds=4)
+            attempt_result = self._try_resting_sell(token, remaining, aggressive_price, crypto, wait_seconds=1.5)
             record_fill(attempt_result)
             if remaining <= 0:
                 avg_price = round(total_proceeds / shares, 4)
@@ -569,7 +601,7 @@ class BreakthroughBot:
         # the position will settle at resolution like any other outcome.
         if remaining > 0:
             log("Escalated all the way to the exchange minimum ($0.01) — placing final floor order", crypto)
-            attempt_result = self._try_resting_sell(token, remaining, 0.01, crypto, wait_seconds=8)
+            attempt_result = self._try_resting_sell(token, remaining, 0.01, crypto, wait_seconds=3)
             record_fill(attempt_result)
 
         if remaining <= 0:
@@ -618,7 +650,7 @@ class BreakthroughBot:
             if filled_amt >= shares:
                 log(f"Limit sell fully filled at ${price}", crypto)
                 return {"filled": filled_amt, "price": price}
-            time.sleep(0.5)
+            time.sleep(0.2)
         try:
             self.client.cancel_order(OrderPayload(orderID=order_id))
         except Exception:
