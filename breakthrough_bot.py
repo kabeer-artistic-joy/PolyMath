@@ -778,6 +778,19 @@ class HourlyBot:
         window_open_price = get_window_open_price(symbol, start_ts) if symbol else None
         if window_open_price:
             log(f"Price to beat this window: ${window_open_price:,.2f}", crypto)
+
+        # Diagnostic: confirm the tokens themselves actually have SOME order
+        # book right at window start — if this is empty even here, the
+        # problem is the market/tokens, not liquidity drying up later.
+        down_check = get_order_book(market["down_token"])
+        up_check = get_order_book(market["up_token"])
+        down_check_ask, _ = best_ask(down_check)
+        up_check_ask, _ = best_ask(up_check)
+        log(f"Market found: slug={market['slug']} | Down token={market['down_token'][:16]}... "
+            f"(ask={down_check_ask}) | Up token={market['up_token'][:16]}... (ask={up_check_ask})", crypto)
+        if down_check_ask is None and up_check_ask is None:
+            log("WARNING: no ask price on EITHER side right at window start — this market may have "
+                "no active liquidity, or the token IDs may be wrong. Watch the next few minutes closely.", crypto)
         else:
             log("Could not fetch price-to-beat — skipping entire window", crypto)
             return
@@ -847,18 +860,18 @@ class HourlyBot:
             abs_delta = abs(delta_value)
             in_split_zone = SPLIT_ZONE_MIN <= abs_delta < SPLIT_ZONE_MAX
 
-            trades_this_window += 1
-            position_open = True
-
             if in_split_zone:
                 book_down = get_order_book(market["down_token"])
                 book_up = get_order_book(market["up_token"])
                 down_ask, _ = best_ask(book_down)
                 up_ask, _ = best_ask(book_up)
                 if down_ask is None or up_ask is None:
-                    position_open = False
+                    log(f"No ask price available for one or both sides (Down ask={down_ask}, "
+                        f"Up ask={up_ask}) — market may have no resting liquidity right now, retrying", crypto)
                     time.sleep(MONITOR_INTERVAL)
                     continue
+                trades_this_window += 1
+                position_open = True
                 log(f"Delta {delta_value:+.2f} ({minutes_left:.0f} min left) is in the moderate-lean zone "
                     f"(${SPLIT_ZONE_MIN}-${SPLIT_ZONE_MAX}) -> SPLIT both sides", crypto)
                 split_outcome = self._enter_split(market, market["condition_id"], down_ask, up_ask, close_ts, crypto)
@@ -885,9 +898,12 @@ class HourlyBot:
             book = get_order_book(token)
             observed_price, _ = best_ask(book)
             if observed_price is None:
-                position_open = False
+                log(f"No ask price available for {delta_side} token — market may have no resting "
+                    f"liquidity right now, retrying", crypto)
                 time.sleep(MONITOR_INTERVAL)
                 continue
+            trades_this_window += 1
+            position_open = True
             observed_bid, _ = best_bid(book)
             spread_at_buy = round(observed_price - observed_bid, 4) if observed_bid is not None else None
 
