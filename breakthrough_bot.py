@@ -190,45 +190,73 @@ def _et_slug_candidates(start_ts: int):
         f"bitcoin-up-or-down-{month}-{day}-{dt_et.year}-{hour_12}{ampm}-et",
     ]
 
+def _validate_token_on_clob(token_id: str) -> bool:
+    """Confirms a token ID actually resolves on the CLOB (not a 404) —
+    confirmed live: a matched event can contain token IDs that don't
+    actually exist on the CLOB, which looks identical to 'no liquidity'
+    unless specifically checked for."""
+    try:
+        r = requests.get(f"{CLOB_API}/book", params={"token_id": token_id}, timeout=3)
+        return r.status_code != 404
+    except Exception:
+        return False
+
 def get_window_market(slug_prefix: str, start_ts: int):
     # Try the clean deterministic pattern first (works for 5m/15m/4h,
     # unconfirmed for 1h specifically), then fall back to the ET-based
-    # human slug in both known year variants.
+    # human slug in both known year variants. Now tries ALL candidates
+    # exhaustively if an earlier match's markets all fail validation,
+    # rather than stopping at the first event found regardless of whether
+    # its tokens actually work.
     candidates = [f"{slug_prefix}-{start_ts}"] + _et_slug_candidates(start_ts)
-    event = None
-    matched_slug = None
+
     for slug in candidates:
         try:
             r = requests.get(f"{GAMMA_API}/events", params={"slug": slug}, timeout=3)
             r.raise_for_status()
             data = r.json()
-            if data:
-                event = data[0]
-                matched_slug = slug
-                break
+            if not data:
+                continue
+            event = data[0]
         except Exception:
             continue
-    if event is None:
-        return None
-    markets = event.get("markets", [])
-    if not markets:
-        return None
-    market = markets[0]
-    try:
-        outcomes       = json.loads(market.get("outcomes", "[]"))
-        clob_token_ids = json.loads(market.get("clobTokenIds", "[]"))
-    except Exception:
-        return None
-    if len(outcomes) < 2 or len(clob_token_ids) < 2:
-        return None
-    tokens = dict(zip(outcomes, clob_token_ids))
-    if "Down" not in tokens or "Up" not in tokens:
-        return None
-    return {
-        "slug": matched_slug, "crypto": MARKETS[slug_prefix], "start_ts": start_ts, "close_ts": start_ts + WINDOW_SECONDS,
-        "down_token": tokens["Down"], "up_token": tokens["Up"],
-        "condition_id": market.get("conditionId", ""), "title": event.get("title", ""),
-    }
+
+        markets = event.get("markets", [])
+        if not markets:
+            continue
+
+        # REAL BUG FIXED HERE: confirmed live via an actual HTTP 404 from the
+        # CLOB — blindly taking markets[0] can hand back a token ID that
+        # doesn't exist on the CLOB at all, which looks identical to "no
+        # liquidity" unless specifically checked. Validate each candidate
+        # market's tokens actually resolve before accepting it.
+        for market in markets:
+            try:
+                outcomes       = json.loads(market.get("outcomes", "[]"))
+                clob_token_ids = json.loads(market.get("clobTokenIds", "[]"))
+            except Exception:
+                continue
+            if len(outcomes) < 2 or len(clob_token_ids) < 2:
+                continue
+            tokens = dict(zip(outcomes, clob_token_ids))
+            if "Down" not in tokens or "Up" not in tokens:
+                continue
+            down_valid = _validate_token_on_clob(tokens["Down"])
+            up_valid = _validate_token_on_clob(tokens["Up"])
+            if down_valid and up_valid:
+                return {
+                    "slug": slug, "crypto": MARKETS[slug_prefix], "start_ts": start_ts,
+                    "close_ts": start_ts + WINDOW_SECONDS,
+                    "down_token": tokens["Down"], "up_token": tokens["Up"],
+                    "condition_id": market.get("conditionId", ""), "title": event.get("title", ""),
+                }
+            log(f"Rejected a candidate market (slug={slug}, title='{event.get('title','')}', "
+                f"condition={market.get('conditionId','')[:16]}...) — token validation failed "
+                f"(Down valid={down_valid}, Up valid={up_valid})")
+
+    log(f"No candidate slug produced a market with tokens that actually validate on the CLOB — "
+        f"tried: {candidates}")
+    return None
 
 def get_order_book(token_id: str) -> dict:
     try:
@@ -788,7 +816,10 @@ class HourlyBot:
         close_ts = start_ts + WINDOW_SECONDS
         symbol = SYMBOLS.get(crypto)
         market = None
-        find_deadline = now_unix() + 5
+        find_deadline = now_unix() + 15  # generous — the new token-validation logic does more HTTP
+                                            # calls per attempt (checking each candidate market's tokens
+                                            # actually resolve), worth the extra time given we have a
+                                            # full hour to work with either way
         while now_unix() < find_deadline:
             market = get_window_market(slug_prefix, start_ts)
             if market:
