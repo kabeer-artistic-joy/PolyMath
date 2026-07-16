@@ -235,7 +235,12 @@ def get_order_book(token_id: str) -> dict:
         r = requests.get(f"{CLOB_API}/book", params={"token_id": token_id}, timeout=2)
         r.raise_for_status()
         return r.json()
-    except Exception:
+    except Exception as e:
+        # REAL BUG FIXED HERE: this was silently swallowing every failure,
+        # making a broken token ID look identical to a genuinely empty book.
+        # Confirmed live: this exact pattern hid a real problem behind a
+        # misleading "no liquidity" message for 30+ minutes straight.
+        log(f"get_order_book failed for token {token_id[:20]}...: {e}")
         return {}
 
 def best_ask(book: dict):
@@ -803,19 +808,29 @@ class HourlyBot:
         # Diagnostic: confirm the tokens themselves actually have SOME order
         # book right at window start, and show the actual event title so a
         # wrong-market match is immediately visible, not just wrong token IDs.
-        down_check = get_order_book(market["down_token"])
-        up_check = get_order_book(market["up_token"])
+        down_token_raw = market["down_token"]
+        up_token_raw = market["up_token"]
+        log(f"Market found: '{market.get('title', '(no title)')}' | slug={market['slug']}", crypto)
+        log(f"Down token (len={len(down_token_raw)}): {down_token_raw} | "
+            f"Up token (len={len(up_token_raw)}): {up_token_raw}", crypto)
+        if not down_token_raw or not up_token_raw or len(down_token_raw) < 20 or len(up_token_raw) < 20:
+            log("WARNING: a token ID looks malformed (empty or unusually short) — real Polymarket "
+                "CLOB token IDs are long numeric strings. This is likely the actual problem, not "
+                "a liquidity gap. The market match (title above) or the outcomes/clobTokenIds parsing "
+                "may be wrong for this specific event.", crypto)
+
+        down_check = get_order_book(down_token_raw)
+        up_check = get_order_book(up_token_raw)
         down_check_ask, _ = best_ask(down_check)
         up_check_ask, _ = best_ask(up_check)
         down_check_bid, _ = best_bid(down_check)
         up_check_bid, _ = best_bid(up_check)
-        log(f"Market found: '{market.get('title', '(no title)')}' | slug={market['slug']}", crypto)
-        log(f"Down token={market['down_token'][:16]}... (ask={down_check_ask}, bid={down_check_bid}) | "
-            f"Up token={market['up_token'][:16]}... (ask={up_check_ask}, bid={up_check_bid})", crypto)
-        if down_check_ask is None and up_check_ask is None:
-            log("No resting asks on either side right at window start — this can be normal for a thin "
-                "market (bids exist, sellers just haven't shown up yet). The buy logic below now falls "
-                "back to pricing off the best bid when no ask is available, instead of giving up.", crypto)
+        log(f"Order book check: Down (ask={down_check_ask}, bid={down_check_bid}) | "
+            f"Up (ask={up_check_ask}, bid={up_check_bid})", crypto)
+        if down_check_ask is None and up_check_ask is None and down_check_bid is None and up_check_bid is None:
+            log("Genuinely nothing on either side (no ask, no bid) for BOTH tokens right at window "
+                "start — if this persists for many minutes, it's very likely a broken token ID or a "
+                "wrong market match, not real market conditions. Check the token IDs and title above.", crypto)
 
         trades_this_window = 0
         cumulative_pnl_this_window = 0.0
