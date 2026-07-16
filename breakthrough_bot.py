@@ -99,6 +99,9 @@ MIN_DELTA_PCT_TO_TRUST = 0.01    # same validated starting point as the 5-min bo
 BUY_CEILING_BUFFER = 0.02        # willing to pay up to (observed price + this) — same as the 5-min bot;
                                     # no reason to cap entry price, the dominant/settled side is exactly
                                     # where we want to be, even at a high price
+THIN_MARKET_BUY_BUFFER = 0.05    # wider buffer used specifically when pricing off the best BID instead
+                                    # of an ask (no ask currently resting) — a real spread gap needs a
+                                    # more generous offer to have a realistic chance of actually filling
 BUY_TIMEOUT_SEC = 2.0
 
 PROFIT_MARGIN = 0.02             # take-profit target — MUCH tighter than the 5-min bot's 0.15, since an
@@ -252,6 +255,21 @@ def best_bid(book: dict):
 def next_window_start(now: float) -> int:
     return int((now // WINDOW_SECONDS) + 1) * WINDOW_SECONDS
 
+def get_reference_price(token_id: str):
+    """Returns a usable reference price for a token: the real ask if one
+    exists, otherwise falls back to the best bid — a thin market can have
+    bids with no resting asks at a given moment, which isn't the same as
+    having no liquidity at all. Returns (price, is_ask) or (None, None) if
+    genuinely nothing is available on either side."""
+    book = get_order_book(token_id)
+    ask, _ = best_ask(book)
+    if ask is not None:
+        return ask, True
+    bid, _ = best_bid(book)
+    if bid is not None:
+        return bid, False
+    return None, None
+
 # ─── PERSISTENT CSV LOG ──────────────────────────────────────────────────────
 CSV_FIELDS = [
     "timestamp", "bot_name", "mode", "crypto", "slug", "trade_num_this_window",
@@ -393,8 +411,9 @@ class HourlyBot:
             return {"result": "error", "shares": 0}
 
     # ── BUY (proven pattern, reused from the 5-min bot unchanged) ───────────
-    def _attempt_buy(self, token: str, observed_price: float, crypto: str) -> dict:
-        ceiling = round(observed_price + BUY_CEILING_BUFFER, 4)
+    def _attempt_buy(self, token: str, observed_price: float, crypto: str, buffer_override: float = None) -> dict:
+        buffer_to_use = buffer_override if buffer_override is not None else BUY_CEILING_BUFFER
+        ceiling = round(observed_price + buffer_to_use, 4)
         MIN_SHARES = 5  # confirmed real exchange minimum. At $10/trade, this never actually
                           # binds above the intended spend (5 shares costs at most $4.95, since
                           # price is always < $1) — unlike the 5-min bot's $2 trades, no conflict here.
@@ -776,24 +795,27 @@ class HourlyBot:
             return
 
         window_open_price = get_window_open_price(symbol, start_ts) if symbol else None
-        if window_open_price:
-            log(f"Price to beat this window: ${window_open_price:,.2f}", crypto)
+        if not window_open_price:
+            log("Could not fetch price-to-beat — skipping entire window", crypto)
+            return
+        log(f"Price to beat this window: ${window_open_price:,.2f}", crypto)
 
         # Diagnostic: confirm the tokens themselves actually have SOME order
-        # book right at window start — if this is empty even here, the
-        # problem is the market/tokens, not liquidity drying up later.
+        # book right at window start, and show the actual event title so a
+        # wrong-market match is immediately visible, not just wrong token IDs.
         down_check = get_order_book(market["down_token"])
         up_check = get_order_book(market["up_token"])
         down_check_ask, _ = best_ask(down_check)
         up_check_ask, _ = best_ask(up_check)
-        log(f"Market found: slug={market['slug']} | Down token={market['down_token'][:16]}... "
-            f"(ask={down_check_ask}) | Up token={market['up_token'][:16]}... (ask={up_check_ask})", crypto)
+        down_check_bid, _ = best_bid(down_check)
+        up_check_bid, _ = best_bid(up_check)
+        log(f"Market found: '{market.get('title', '(no title)')}' | slug={market['slug']}", crypto)
+        log(f"Down token={market['down_token'][:16]}... (ask={down_check_ask}, bid={down_check_bid}) | "
+            f"Up token={market['up_token'][:16]}... (ask={up_check_ask}, bid={up_check_bid})", crypto)
         if down_check_ask is None and up_check_ask is None:
-            log("WARNING: no ask price on EITHER side right at window start — this market may have "
-                "no active liquidity, or the token IDs may be wrong. Watch the next few minutes closely.", crypto)
-        else:
-            log("Could not fetch price-to-beat — skipping entire window", crypto)
-            return
+            log("No resting asks on either side right at window start — this can be normal for a thin "
+                "market (bids exist, sellers just haven't shown up yet). The buy logic below now falls "
+                "back to pricing off the best bid when no ask is available, instead of giving up.", crypto)
 
         trades_this_window = 0
         cumulative_pnl_this_window = 0.0
@@ -861,19 +883,19 @@ class HourlyBot:
             in_split_zone = SPLIT_ZONE_MIN <= abs_delta < SPLIT_ZONE_MAX
 
             if in_split_zone:
-                book_down = get_order_book(market["down_token"])
-                book_up = get_order_book(market["up_token"])
-                down_ask, _ = best_ask(book_down)
-                up_ask, _ = best_ask(book_up)
+                down_ask, down_is_ask = get_reference_price(market["down_token"])
+                up_ask, up_is_ask = get_reference_price(market["up_token"])
                 if down_ask is None or up_ask is None:
-                    log(f"No ask price available for one or both sides (Down ask={down_ask}, "
-                        f"Up ask={up_ask}) — market may have no resting liquidity right now, retrying", crypto)
+                    log(f"No price available (neither ask nor bid) for one or both sides "
+                        f"(Down={down_ask}, Up={up_ask}) — genuinely no liquidity at all right now, retrying", crypto)
                     time.sleep(MONITOR_INTERVAL)
                     continue
                 trades_this_window += 1
                 position_open = True
+                ref_note = f"(Down priced off {'ask' if down_is_ask else 'bid (no ask available)'}, " \
+                           f"Up priced off {'ask' if up_is_ask else 'bid (no ask available)'})"
                 log(f"Delta {delta_value:+.2f} ({minutes_left:.0f} min left) is in the moderate-lean zone "
-                    f"(${SPLIT_ZONE_MIN}-${SPLIT_ZONE_MAX}) -> SPLIT both sides", crypto)
+                    f"(${SPLIT_ZONE_MIN}-${SPLIT_ZONE_MAX}) -> SPLIT both sides {ref_note}", crypto)
                 split_outcome = self._enter_split(market, market["condition_id"], down_ask, up_ask, close_ts, crypto)
                 cumulative_pnl_this_window += float(split_outcome["pnl_usd"] or 0)
                 row = {
@@ -895,24 +917,26 @@ class HourlyBot:
             # or the extreme/decided zone (delta >= SPLIT_ZONE_MAX) — always bet
             # the leaning/dominant side, never the side unlikely to move.
             token = market["up_token"] if delta_side == "Up" else market["down_token"]
-            book = get_order_book(token)
-            observed_price, _ = best_ask(book)
+            observed_price, is_ask = get_reference_price(token)
             if observed_price is None:
-                log(f"No ask price available for {delta_side} token — market may have no resting "
-                    f"liquidity right now, retrying", crypto)
+                log(f"No price available (neither ask nor bid) for {delta_side} token — genuinely no "
+                    f"liquidity at all right now, retrying", crypto)
                 time.sleep(MONITOR_INTERVAL)
                 continue
             trades_this_window += 1
             position_open = True
+            book = get_order_book(token)
             observed_bid, _ = best_bid(book)
             spread_at_buy = round(observed_price - observed_bid, 4) if observed_bid is not None else None
+            ref_note = "ask" if is_ask else "bid (no ask currently resting)"
 
             zone_label = "extreme/decided" if abs_delta >= SPLIT_ZONE_MAX else "early/uncertain"
             log(f"Delta signal (trade {trades_this_window}, {minutes_left:.0f} min left, {zone_label} zone): "
                 f"{delta_value:+.2f} ({delta_pct:.4f}%) -> buying {delta_side} @ ~${observed_price} "
-                f"(spread: ${spread_at_buy})", crypto)
+                f"(priced off {ref_note}, spread: ${spread_at_buy})", crypto)
 
-            buy_info = self._attempt_buy(token, observed_price, crypto)
+            buy_buffer = BUY_CEILING_BUFFER if is_ask else THIN_MARKET_BUY_BUFFER
+            buy_info = self._attempt_buy(token, observed_price, crypto, buffer_override=buy_buffer)
             row = {
                 "timestamp": ts_str(), "bot_name": self.bot_name, "mode": self.mode_str, "crypto": crypto,
                 "slug": market["slug"], "trade_num_this_window": trades_this_window,
