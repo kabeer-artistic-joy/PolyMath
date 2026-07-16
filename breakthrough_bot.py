@@ -522,7 +522,7 @@ class HourlyBot:
         return {"result": "bought", "price": ceiling, "shares": final_shares}
 
     # ── SELL: take-profit + time backstop, NO stop-loss ─────────────────────
-    def _watch_for_sell(self, token: str, buy_price: float, raw_shares: float, crypto: str) -> dict:
+    def _watch_for_sell(self, token: str, buy_price: float, raw_shares: float, crypto: str, close_ts: float) -> dict:
         shares = int(raw_shares)
         if shares != raw_shares:
             log(f"Buy partially filled: held {raw_shares}, flooring to {shares} whole shares", crypto)
@@ -583,7 +583,7 @@ class HourlyBot:
                     pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
                     return {**exit_result, "pnl_usd": pnl, "notes": "take-profit placement failed"}
 
-            deadline = buy_time + BACKSTOP_SECONDS
+            deadline = min(buy_time + BACKSTOP_SECONDS, close_ts)
             while now_unix() < deadline:
                 if self.stop_event.is_set():
                     # Bot is being stopped — still resolve THIS position cleanly rather than abandon it
@@ -611,7 +611,8 @@ class HourlyBot:
             return {**exit_result, "pnl_usd": pnl, "notes": "backstop timeout, force-exit (no stop-loss)"}
 
         # DRY-RUN
-        while now_unix() - buy_time < BACKSTOP_SECONDS:
+        dry_run_deadline = min(buy_time + BACKSTOP_SECONDS, close_ts)
+        while now_unix() < dry_run_deadline:
             book = get_order_book(token)
             bid_price, bid_size = best_bid(book)
             if bid_price is not None and bid_size >= shares and take_profit_price is not None:
@@ -999,7 +1000,7 @@ class HourlyBot:
                 time.sleep(MONITOR_INTERVAL)
                 continue
 
-            sell_info = self._watch_for_sell(token, buy_info["price"], buy_info["shares"], crypto)
+            sell_info = self._watch_for_sell(token, buy_info["price"], buy_info["shares"], crypto, close_ts)
             cumulative_pnl_this_window += float(sell_info["pnl_usd"] or 0)
             row.update({
                 "sell_result": sell_info["result"], "sell_price": sell_info["price"],
