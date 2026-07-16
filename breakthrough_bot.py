@@ -93,7 +93,6 @@ ERC20_ABI = [
 ]
 
 WINDOW_SECONDS = 3600            # 1 hour, vs the original bot's 300 (5 min)
-BINANCE_KLINE_INTERVAL = "1h"    # matches WINDOW_SECONDS
 
 MIN_DELTA_PCT_TO_TRUST = 0.01    # same validated starting point as the 5-min bot — filters pure noise
 BUY_CEILING_BUFFER = 0.02        # willing to pay up to (observed price + this) — same as the 5-min bot;
@@ -154,32 +153,6 @@ def get_binance_price(symbol: str):
     except Exception:
         return None
 
-def get_window_open_price(symbol: str, window_ts: int):
-    """Fetches the real 'price to beat' for a 1-hour window — BTC's price
-    at the moment this window opened, using the matching 1h Binance candle."""
-    try:
-        r = requests.get(
-            f"{BINANCE_API}/api/v3/klines",
-            params={"symbol": symbol, "interval": BINANCE_KLINE_INTERVAL,
-                     "startTime": window_ts * 1000, "limit": 1},
-            timeout=3,
-        )
-        r.raise_for_status()
-        candles = r.json()
-        if candles:
-            return float(candles[0][1])
-        # REAL BUG FIXED HERE: an empty list isn't an exception, so this
-        # never got logged before — confirmed live: querying right at the
-        # exact top of the hour can hit Binance before that hour's candle
-        # has any data yet. Fall back to the current spot price, which at
-        # this early moment is essentially identical to the true window-open
-        # price anyway, rather than abandoning the whole window.
-        log(f"1h candle for window {window_ts} came back empty (likely queried right at the top "
-            f"of the hour, before Binance has data for it yet) — falling back to current spot price")
-        return get_binance_price(symbol)
-    except Exception as e:
-        log(f"get_window_open_price failed for window {window_ts}: {e} — falling back to current spot price")
-        return get_binance_price(symbol)
 
 def _et_slug_candidates(start_ts: int):
     """1-hour markets use an Eastern-Time, human-readable slug — confirmed
@@ -797,14 +770,15 @@ class HourlyBot:
             f"(potential +${potential_total:.2f})", crypto)
 
     def _run_split_trade_thread(self, market: dict, down_ask: float, up_ask: float,
-                                   close_ts: float, crypto: str, row_base: dict):
+                                   close_ts: float, crypto: str, row_base: dict, window_open_price: float):
         # Split mints self.amount shares of EACH side at the fixed $1/pair
         # rate — potential pnl if BOTH legs hit their +PROFIT_MARGIN target:
         potential = self.amount * PROFIT_MARGIN * 2
         pos_id = self.position_tracker.register_open(potential)
         log(f"Split position opened (id={pos_id}): potential +${potential:.2f} if both legs hit target", crypto)
 
-        split_outcome = self._enter_split(market, market["condition_id"], down_ask, up_ask, close_ts, crypto)
+        split_outcome = self._enter_split(market, market["condition_id"], down_ask, up_ask, close_ts, crypto,
+                                            window_open_price)
         actual_pnl = float(split_outcome["pnl_usd"] or 0)
         self.position_tracker.resolve(pos_id, actual_pnl)
         realized, potential_total, n_open = self.position_tracker.totals()
@@ -849,7 +823,7 @@ class HourlyBot:
         return bid_size >= needed_shares * 0.5  # at least half our intended size resting as real interest
 
     def _enter_split(self, market: dict, condition_id: str, down_ask: float, up_ask: float,
-                       close_ts: float, crypto: str) -> dict:
+                       close_ts: float, crypto: str, window_open_price: float) -> dict:
         """Buys BOTH sides via split and places a take-profit sell on each —
         used only in the moderate-lean zone, where either side still has a
         real chance of a small favorable wiggle. No stop-loss here either —
@@ -938,10 +912,13 @@ class HourlyBot:
 
         # Window closed with one or both legs never having hit target —
         # resolve at REAL market settlement, never a forced early exit.
+        # Uses the SAME window_open_price established at window start,
+        # not an independent re-fetch (which would both risk the same
+        # race condition and risk a subtly different reference value
+        # than what entry decisions were based on).
         symbol = SYMBOLS.get(crypto)
         final_price = get_binance_price(symbol)
-        window_open = get_window_open_price(symbol, market["start_ts"])
-        up_won = (final_price is not None and window_open is not None and final_price > window_open)
+        up_won = (final_price is not None and window_open_price is not None and final_price > window_open_price)
         if not down_sold:
             down_exit = 0.0 if up_won else 1.0
         if not up_sold:
@@ -971,7 +948,13 @@ class HourlyBot:
                 f"(if this happens every window, the 1h slug format needs checking)", crypto)
             return
 
-        window_open_price = get_window_open_price(symbol, start_ts) if symbol else None
+        # REAL FIX: previously looked up the historical 1h candle via
+        # get_window_open_price, which can race against Binance's own
+        # candle-indexing right at the top of the hour. Since this is
+        # ALWAYS called within seconds of the window actually starting,
+        # the current spot price IS the window-open price for practical
+        # purposes — no historical lookup needed, no race condition possible.
+        window_open_price = get_binance_price(symbol) if symbol else None
         if not window_open_price:
             log("Could not fetch price-to-beat — skipping entire window", crypto)
             return
@@ -1093,7 +1076,8 @@ class HourlyBot:
                 log(f"Delta {delta_value:+.2f} ({minutes_left:.0f} min left) is in the moderate-lean zone "
                     f"(${SPLIT_ZONE_MIN}-${SPLIT_ZONE_MAX}) -> SPLIT both sides (trade {this_trade_num})", crypto)
                 t = threading.Thread(target=self._run_split_trade_thread,
-                                       args=(market, down_ask, up_ask, close_ts, crypto, row_base), daemon=True)
+                                       args=(market, down_ask, up_ask, close_ts, crypto, row_base, window_open_price),
+                                       daemon=True)
                 t.start()
                 open_threads.append(t)
                 time.sleep(MONITOR_INTERVAL)
