@@ -107,10 +107,10 @@ BUY_TIMEOUT_SEC = 2.0
 PROFIT_MARGIN = 0.02             # take-profit target — MUCH tighter than the 5-min bot's 0.15, since an
                                     # hour gives far more time for even a small favorable wiggle to occur
 # NO STOP-LOSS. Time itself is the risk control here, not a reactive cut.
-BACKSTOP_SECONDS = 600           # ultimate backstop only — if take-profit never hits this long after
-                                    # buying, force-exit at best available price. 10 minutes, not 60-80s
-                                    # like the 5-min bot, since this window has vastly more time to spare
-                                    # and a premature exit here defeats the whole point of using 1h markets
+# NO BACKSTOP by explicit request — a position exits ONLY via its take-profit
+# order hitting, or real market settlement at window close. No time-based
+# force-exit in between; that was still cutting positions off early, just
+# on a timer instead of a price trigger, defeating the point of a long window.
 
 # ─── THREE ENTRY ZONES BY |delta from price-to-beat| ────────────────────────
 # Starting thresholds based directly on the examples given (a $50-150 lean
@@ -326,6 +326,45 @@ class TradeLogger:
                 csv.writer(f).writerow([row[k] for k in CSV_FIELDS])
 
 # ─── CORE BOT ────────────────────────────────────────────────────────────────
+class PositionTracker:
+    """Tracks realized pnl (from closed trades) and potential pnl (from
+    currently-open, unresolved positions, assuming each hits its own
+    take-profit) for ONE window. Thread-safe since multiple positions can
+    now be open concurrently, each resolving in its own thread.
+
+    The gating logic: stop opening NEW positions once realized + potential
+    reaches the target — but if an open position ends up losing instead of
+    winning, potential shrinks and realized may drop, automatically
+    re-opening the gate for new entries without any separate 'resume' step."""
+    def __init__(self, target_profit: float):
+        self.target_profit = target_profit
+        self.lock = threading.Lock()
+        self.realized_pnl = 0.0
+        self.open_positions = {}  # position_id -> potential pnl if it hits target
+        self._next_id = 0
+
+    def register_open(self, potential_pnl_contribution: float) -> int:
+        with self.lock:
+            pos_id = self._next_id
+            self._next_id += 1
+            self.open_positions[pos_id] = potential_pnl_contribution
+            return pos_id
+
+    def resolve(self, pos_id: int, actual_pnl: float):
+        with self.lock:
+            self.open_positions.pop(pos_id, None)
+            self.realized_pnl += actual_pnl
+
+    def should_stop_new_entries(self) -> bool:
+        with self.lock:
+            return (self.realized_pnl + sum(self.open_positions.values())) >= self.target_profit
+
+    def totals(self):
+        with self.lock:
+            potential = sum(self.open_positions.values())
+            return self.realized_pnl, potential, len(self.open_positions)
+
+
 class HourlyBot:
     def __init__(self, dry_run: bool, amount: float):
         self.dry_run  = dry_run
@@ -345,14 +384,14 @@ class HourlyBot:
         log(f"Direction: delta-from-price-to-beat only (min {MIN_DELTA_PCT_TO_TRUST}% to trust) — "
             f"same signal as the 5-min bot, always betting the leaning/dominant side")
         log(f"Buy: observed price + ${BUY_CEILING_BUFFER} buffer (no fixed ceiling) | timeout {BUY_TIMEOUT_SEC}s")
-        log(f"Sell: take-profit entry+${PROFIT_MARGIN} | NO stop-loss | backstop {BACKSTOP_SECONDS}s "
-            f"({BACKSTOP_SECONDS/60:.0f} min)")
-        log(f"ONE position at a time | last {LATE_WINDOW_CUTOFF_MIN} min: extra caution "
-            f"({LATE_WINDOW_OBSERVATION_SEC}s observation before entering, not a ban)")
+        log(f"Sell: take-profit entry+${PROFIT_MARGIN} | NO stop-loss, NO backstop — holds to window "
+            f"close and resolves at real settlement if target never hits")
+        log(f"MULTIPLE concurrent positions allowed | momentum-persistence + order-book-depth "
+            f"confirmation on every entry | last {LATE_WINDOW_CUTOFF_MIN} min: longer observation")
         log(f"Zones by |delta|: <${SPLIT_ZONE_MIN} or >=${SPLIT_ZONE_MAX} -> single-sided dominant side | "
             f"${SPLIT_ZONE_MIN}-${SPLIT_ZONE_MAX} -> SPLIT both sides")
-        log(f"Session target: stop opening new positions once cumulative profit this window reaches "
-            f"+${TARGET_PROFIT_PER_WINDOW}")
+        log(f"Session target: stop opening NEW positions once realized + potential (from open positions) "
+            f"reaches +${TARGET_PROFIT_PER_WINDOW} — already-open positions still resolve independently")
         log(f"Trade log: {self.logger.path}")
         log("=" * 70)
 
@@ -522,7 +561,8 @@ class HourlyBot:
         return {"result": "bought", "price": ceiling, "shares": final_shares}
 
     # ── SELL: take-profit + time backstop, NO stop-loss ─────────────────────
-    def _watch_for_sell(self, token: str, buy_price: float, raw_shares: float, crypto: str, close_ts: float) -> dict:
+    def _watch_for_sell(self, token: str, buy_price: float, raw_shares: float, crypto: str, close_ts: float,
+                          side: str, window_open_price: float, symbol: str) -> dict:
         shares = int(raw_shares)
         if shares != raw_shares:
             log(f"Buy partially filled: held {raw_shares}, flooring to {shares} whole shares", crypto)
@@ -536,11 +576,17 @@ class HourlyBot:
         # accepts prices $0.01-$0.99, never place an order outside that.
         take_profit_price = min(round(buy_price + PROFIT_MARGIN, 4), 0.99)
         if take_profit_price <= buy_price:
-            log(f"Buy price ${buy_price} leaves no room for a take-profit — will force-exit at the backstop", crypto)
+            log(f"Buy price ${buy_price} leaves no room for a take-profit — will hold to window close, "
+                f"resolving at real settlement", crypto)
             take_profit_price = None
 
+        # NO BACKSTOP. By explicit request: a position exits ONLY two ways —
+        # its take-profit order fills, or the window closes and it resolves
+        # at the real market outcome. No time-based force-exit in between,
+        # since that was still cutting positions off before the window's
+        # actual time was used, just on a timer instead of a price trigger.
         log(f"Take-profit: {'$'+str(take_profit_price) if take_profit_price else 'N/A (no room)'} "
-            f"(+${PROFIT_MARGIN}) | backstop {BACKSTOP_SECONDS}s | NO stop-loss", crypto)
+            f"(+${PROFIT_MARGIN}) | holds to window close if never hit | NO stop-loss, NO backstop", crypto)
         buy_time = now_unix()
 
         if not self.dry_run:
@@ -578,16 +624,12 @@ class HourlyBot:
                     tp_order_id = tp_resp.get("orderID", "")
                     log(f"Take-profit resting order placed at ${take_profit_price}", crypto)
                 except Exception as e:
-                    log(f"Could not place take-profit order ({e}) — forcing exit immediately", crypto)
-                    exit_result = self._guaranteed_sell(token, shares, crypto)
-                    pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
-                    return {**exit_result, "pnl_usd": pnl, "notes": "take-profit placement failed"}
+                    log(f"Could not place take-profit order ({e}) — this position will resolve at "
+                        f"window close instead", crypto)
 
-            deadline = min(buy_time + BACKSTOP_SECONDS, close_ts)
-            while now_unix() < deadline:
+            while now_unix() < close_ts:
                 if self.stop_event.is_set():
-                    # Bot is being stopped — still resolve THIS position cleanly rather than abandon it
-                    pass
+                    break
                 if tp_order_id is not None:
                     try:
                         detail = self.client.get_order(tp_order_id)
@@ -600,19 +642,17 @@ class HourlyBot:
                         pass
                 time.sleep(POLL_INTERVAL_SLOW)
 
+            # Window closed without hitting target — cancel the resting order
+            # and resolve at the REAL market outcome, not a forced exit price.
             if tp_order_id is not None:
                 try:
                     self.client.cancel_order(OrderPayload(orderID=tp_order_id))
                 except Exception:
                     pass
-            log(f"{BACKSTOP_SECONDS}s since buying, take-profit never hit — force-exiting", crypto)
-            exit_result = self._guaranteed_sell(token, shares, crypto)
-            pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
-            return {**exit_result, "pnl_usd": pnl, "notes": "backstop timeout, force-exit (no stop-loss)"}
+            return self._resolve_single_at_settlement(buy_price, shares, side, window_open_price, symbol, crypto)
 
         # DRY-RUN
-        dry_run_deadline = min(buy_time + BACKSTOP_SECONDS, close_ts)
-        while now_unix() < dry_run_deadline:
+        while now_unix() < close_ts:
             book = get_order_book(token)
             bid_price, bid_size = best_bid(book)
             if bid_price is not None and bid_size >= shares and take_profit_price is not None:
@@ -623,10 +663,22 @@ class HourlyBot:
                     return {"result": "sold_take_profit", "price": take_profit_price, "pnl_usd": pnl,
                             "notes": "take_profit hit", "seconds_to_sell": elapsed}
             time.sleep(POLL_INTERVAL_SLOW)
-        log(f"{BACKSTOP_SECONDS}s since buying, take-profit never hit — force-exiting at best price", crypto)
-        exit_result = self._guaranteed_sell(token, shares, crypto)
-        pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
-        return {**exit_result, "pnl_usd": pnl, "notes": "backstop timeout, force-exit (no stop-loss)", "seconds_to_sell": BACKSTOP_SECONDS}
+        return self._resolve_single_at_settlement(buy_price, shares, side, window_open_price, symbol, crypto)
+
+    def _resolve_single_at_settlement(self, buy_price: float, shares: float, side: str,
+                                         window_open_price: float, symbol: str, crypto: str) -> dict:
+        """Window closed without the take-profit ever hitting — resolves at
+        the REAL market outcome (the side either pays $1/share or $0/share),
+        not a forced exit at whatever price happened to be available."""
+        final_price = get_binance_price(symbol)
+        up_won = (final_price is not None and window_open_price is not None and final_price > window_open_price)
+        this_side_won = up_won if side == "Up" else (not up_won)
+        resolve_price = 1.0 if this_side_won else 0.0
+        pnl = round((resolve_price - buy_price) * shares, 4)
+        log(f"Window closed, take-profit never hit — resolved to ${resolve_price} at real settlement, "
+            f"pnl={'+' if pnl>=0 else ''}${pnl}", crypto)
+        return {"result": "resolved_at_close", "price": resolve_price, "pnl_usd": pnl,
+                "notes": f"held to window close, resolved to ${resolve_price} (no backstop, no early exit)"}
 
     def _guaranteed_sell(self, token: str, shares: float, crypto: str, max_market_attempts: int = 2) -> dict:
         """Proven, hard-won mechanism from the 5-min bot — retries a market
@@ -696,6 +748,95 @@ class HourlyBot:
         return {"result": "unsold_no_liquidity", "price": None}
 
     # ── SPLIT ENTRY (moderate-lean zone only) ────────────────────────────────
+    # ── CONCURRENT TRADE WORKERS (each runs in its own thread) ───────────────
+    def _run_single_trade_thread(self, token: str, entry_price_ref: float, is_ask: bool,
+                                    delta_side: str, close_ts: float, crypto: str, row_base: dict,
+                                    window_open_price: float, symbol: str):
+        buy_buffer = BUY_CEILING_BUFFER if is_ask else THIN_MARKET_BUY_BUFFER
+        buy_info = self._attempt_buy(token, entry_price_ref, crypto, buffer_override=buy_buffer)
+        row = dict(row_base)
+        row.update({"buy_result": buy_info["result"], "buy_price": buy_info["price"], "buy_shares": buy_info["shares"]})
+        if buy_info["result"] != "bought":
+            realized, _, n_open = self.position_tracker.totals()
+            row.update({"sell_result": "n/a", "sell_price": "", "pnl_usd": 0,
+                        "cumulative_pnl_this_window": round(realized, 4), "notes": "no buy fill"})
+            self._record(row)
+            return
+
+        target_price = min(round(buy_info["price"] + PROFIT_MARGIN, 4), 0.99)
+        potential = max(target_price - buy_info["price"], 0) * buy_info["shares"]
+        pos_id = self.position_tracker.register_open(potential)
+        log(f"Position opened (id={pos_id}): {delta_side} {buy_info['shares']} @ ${buy_info['price']}, "
+            f"potential +${potential:.2f} if it hits target", crypto)
+
+        sell_info = self._watch_for_sell(token, buy_info["price"], buy_info["shares"], crypto, close_ts,
+                                            delta_side, window_open_price, symbol)
+        actual_pnl = float(sell_info["pnl_usd"] or 0)
+        self.position_tracker.resolve(pos_id, actual_pnl)
+        realized, potential_total, n_open = self.position_tracker.totals()
+
+        row.update({
+            "sell_result": sell_info["result"], "sell_price": sell_info["price"],
+            "seconds_to_sell": sell_info.get("seconds_to_sell", ""),
+            "pnl_usd": sell_info["pnl_usd"], "cumulative_pnl_this_window": round(realized, 4),
+            "notes": sell_info["notes"],
+        })
+        self._record(row)
+        log(f"Position resolved (id={pos_id}): realized=${realized:.2f} | still {n_open} open "
+            f"(potential +${potential_total:.2f})", crypto)
+
+    def _run_split_trade_thread(self, market: dict, down_ask: float, up_ask: float,
+                                   close_ts: float, crypto: str, row_base: dict):
+        # Split mints self.amount shares of EACH side at the fixed $1/pair
+        # rate — potential pnl if BOTH legs hit their +PROFIT_MARGIN target:
+        potential = self.amount * PROFIT_MARGIN * 2
+        pos_id = self.position_tracker.register_open(potential)
+        log(f"Split position opened (id={pos_id}): potential +${potential:.2f} if both legs hit target", crypto)
+
+        split_outcome = self._enter_split(market, market["condition_id"], down_ask, up_ask, close_ts, crypto)
+        actual_pnl = float(split_outcome["pnl_usd"] or 0)
+        self.position_tracker.resolve(pos_id, actual_pnl)
+        realized, potential_total, n_open = self.position_tracker.totals()
+
+        row = dict(row_base)
+        row.update({
+            "buy_result": "split", "buy_price": "", "buy_shares": "",
+            "sell_result": split_outcome["outcome"], "sell_price": "",
+            "pnl_usd": split_outcome["pnl_usd"], "cumulative_pnl_this_window": round(realized, 4),
+            "notes": split_outcome["notes"],
+        })
+        self._record(row)
+        log(f"Split position resolved (id={pos_id}): realized=${realized:.2f} | still {n_open} open "
+            f"(potential +${potential_total:.2f})", crypto)
+
+    def _confirm_signal_persists(self, symbol: str, window_open_price: float, delta_side: str,
+                                    observe_seconds: float, crypto: str) -> bool:
+        """Short momentum-persistence check: requires the delta to keep
+        pointing the SAME direction for observe_seconds before trusting it —
+        reduces exposure to pure single-tick noise. This does NOT and cannot
+        guarantee the direction won't reverse later; it only filters out
+        signals that don't even survive a few real seconds."""
+        deadline = now_unix() + observe_seconds
+        while now_unix() < deadline:
+            time.sleep(0.5)
+            check_price = get_binance_price(symbol)
+            if check_price is None:
+                continue
+            check_side = "Up" if (check_price - window_open_price) > 0 else "Down"
+            if check_side != delta_side:
+                return False
+        return True
+
+    def _check_order_book_depth(self, token: str, needed_shares: float) -> bool:
+        """Requires real bid depth behind the current price (not just a
+        wafer-thin book that could vanish immediately) — a basic order-book
+        confirmation, not a guarantee against reversal."""
+        book = get_order_book(token)
+        bid, bid_size = best_bid(book)
+        if bid is None or bid_size is None:
+            return False
+        return bid_size >= needed_shares * 0.5  # at least half our intended size resting as real interest
+
     def _enter_split(self, market: dict, condition_id: str, down_ask: float, up_ask: float,
                        close_ts: float, crypto: str) -> dict:
         """Buys BOTH sides via split and places a take-profit sell on each —
@@ -733,9 +874,9 @@ class HourlyBot:
                 log(f"Could not place Up sell: {e}", crypto)
                 up_order_id = None
 
-        entry_time = now_unix()
-        backstop_deadline = min(close_ts, entry_time + BACKSTOP_SECONDS)
-        while now_unix() < backstop_deadline and not (down_sold and up_sold):
+        # NO BACKSTOP — by explicit request, a position only ever exits via
+        # its own take-profit hit or real market settlement at window close.
+        while now_unix() < close_ts and not (down_sold and up_sold):
             book_down = get_order_book(market["down_token"])
             book_up = get_order_book(market["up_token"])
             down_bid, down_size = best_bid(book_down)
@@ -784,32 +925,20 @@ class HourlyBot:
             pnl = round(proceeds - total_cost, 4)
             return {"outcome": "both_hit", "pnl_usd": pnl, "notes": "both legs hit target"}
 
-        # Neither, or exactly one, sold — resolve the unsold leg(s) if the
-        # window has actually closed by now; otherwise force-exit them at
-        # best available price using the same guaranteed-sell escalation.
-        if now_unix() >= close_ts:
-            symbol = SYMBOLS.get(crypto)
-            final_price = get_binance_price(symbol)
-            window_open = get_window_open_price(symbol, market["start_ts"])
-            up_won = (final_price is not None and window_open is not None and final_price > window_open)
-            if not down_sold:
-                down_exit = 0.0 if up_won else 1.0
-            if not up_sold:
-                up_exit = 1.0 if up_won else 0.0
-            proceeds = shares * down_exit + shares * up_exit
-            pnl = round(proceeds - total_cost, 4)
-            return {"outcome": "resolved_at_close", "pnl_usd": pnl, "notes": "window closed, resolved at settlement"}
-
-        # Backstop hit before window close — force-exit whichever leg(s) never sold
+        # Window closed with one or both legs never having hit target —
+        # resolve at REAL market settlement, never a forced early exit.
+        symbol = SYMBOLS.get(crypto)
+        final_price = get_binance_price(symbol)
+        window_open = get_window_open_price(symbol, market["start_ts"])
+        up_won = (final_price is not None and window_open is not None and final_price > window_open)
         if not down_sold:
-            exit_result = self._guaranteed_sell(market["down_token"], shares, crypto)
-            down_exit = exit_result["price"] if exit_result["price"] is not None else 0.0
+            down_exit = 0.0 if up_won else 1.0
         if not up_sold:
-            exit_result = self._guaranteed_sell(market["up_token"], shares, crypto)
-            up_exit = exit_result["price"] if exit_result["price"] is not None else 0.0
+            up_exit = 1.0 if up_won else 0.0
         proceeds = shares * down_exit + shares * up_exit
         pnl = round(proceeds - total_cost, 4)
-        return {"outcome": "backstop_force_exit", "pnl_usd": pnl, "notes": "backstop timeout, force-exited unsold leg(s)"}
+        outcome = "one_hit_other_resolved" if (down_sold or up_sold) else "neither_hit_resolved_at_close"
+        return {"outcome": outcome, "pnl_usd": pnl, "notes": "held to window close, resolved at real settlement"}
 
     # ── WINDOW LOOP ──────────────────────────────────────────────────────────
     def _monitor_window(self, slug_prefix: str, start_ts: int):
@@ -864,23 +993,23 @@ class HourlyBot:
                 "start — if this persists for many minutes, it's very likely a broken token ID or a "
                 "wrong market match, not real market conditions. Check the token IDs and title above.", crypto)
 
+        self.position_tracker = PositionTracker(TARGET_PROFIT_PER_WINDOW)
         trades_this_window = 0
-        cumulative_pnl_this_window = 0.0
-        position_open = False  # ONE position at a time — gate on this, not a trade counter
+        trade_count_lock = threading.Lock()
+        open_threads = []
 
         while now_unix() < close_ts:
             if self.stop_event.is_set():
-                return
+                break
 
-            # TOP PRIORITY, unconditional: once the session target is reached,
-            # stop opening new positions regardless of time remaining.
-            if cumulative_pnl_this_window >= TARGET_PROFIT_PER_WINDOW:
-                log(f"Session target reached (+${cumulative_pnl_this_window:.2f} >= "
-                    f"+${TARGET_PROFIT_PER_WINDOW}) — no more entries this window, regardless of time left", crypto)
-                time.sleep(MONITOR_INTERVAL)
-                continue
-
-            if position_open:
+            # TOP PRIORITY, unconditional: stop opening NEW positions once the
+            # projected total (realized + potential from open positions) hits
+            # the target — but keep monitoring whatever's already open.
+            if self.position_tracker.should_stop_new_entries():
+                realized, potential, n_open = self.position_tracker.totals()
+                if n_open > 0:
+                    log(f"Projected total (${realized + potential:.2f}) already at/above target — "
+                        f"waiting for {n_open} open position(s) to resolve before considering new entries", crypto)
                 time.sleep(MONITOR_INTERVAL)
                 continue
 
@@ -897,66 +1026,61 @@ class HourlyBot:
                 time.sleep(MONITOR_INTERVAL)
                 continue
 
-            # Late in the window: not a ban, just more caution — require the
-            # delta to hold the SAME direction for a short observation window
-            # before entering, rather than reacting to a single instantaneous read.
-            if minutes_left <= LATE_WINDOW_CUTOFF_MIN:
-                log(f"{minutes_left:.0f} min left — observing {LATE_WINDOW_OBSERVATION_SEC}s before "
-                    f"entering (extra caution this late)", crypto)
-                obs_deadline = now_unix() + LATE_WINDOW_OBSERVATION_SEC
-                confirmed = True
-                while now_unix() < obs_deadline:
-                    time.sleep(0.5)
-                    check_price = get_binance_price(symbol)
-                    if check_price is None:
-                        continue
-                    check_delta = check_price - window_open_price
-                    check_side = "Up" if check_delta > 0 else "Down"
-                    if check_side != delta_side:
-                        log(f"Direction flipped during observation ({delta_side} -> {check_side}) — skipping this signal", crypto)
-                        confirmed = False
-                        break
-                if not confirmed:
-                    time.sleep(MONITOR_INTERVAL)
-                    continue
-                # Refresh the reading after observing, since real time has passed
-                current_btc_price = get_binance_price(symbol) if symbol else current_btc_price
-                if current_btc_price is not None:
-                    delta_value = current_btc_price - window_open_price
-                    delta_pct = abs(delta_value) / window_open_price * 100
-                    delta_side = "Up" if delta_value > 0 else "Down"
+            # Momentum-persistence confirmation on EVERY entry now, not just
+            # late-window ones — longer observation late in the window
+            # (more caution when there's less time to recover), shorter
+            # early on (more time available either way). This reduces
+            # exposure to pure single-tick noise; it does not and cannot
+            # guarantee the direction won't reverse later.
+            observe_secs = LATE_WINDOW_OBSERVATION_SEC if minutes_left <= LATE_WINDOW_CUTOFF_MIN else 2.0
+            log(f"Delta {delta_value:+.2f} ({minutes_left:.0f} min left) — observing {observe_secs}s "
+                f"for persistence before entering", crypto)
+            if not self._confirm_signal_persists(symbol, window_open_price, delta_side, observe_secs, crypto):
+                log(f"Direction did not persist through observation — skipping this signal", crypto)
+                time.sleep(MONITOR_INTERVAL)
+                continue
+
+            # Refresh the reading after observing, since real time has passed
+            current_btc_price = get_binance_price(symbol) if symbol else current_btc_price
+            if current_btc_price is not None:
+                delta_value = current_btc_price - window_open_price
+                delta_pct = abs(delta_value) / window_open_price * 100
+                delta_side = "Up" if delta_value > 0 else "Down"
 
             abs_delta = abs(delta_value)
             in_split_zone = SPLIT_ZONE_MIN <= abs_delta < SPLIT_ZONE_MAX
+
+            with trade_count_lock:
+                trades_this_window += 1
+                this_trade_num = trades_this_window
+
+            row_base = {
+                "timestamp": ts_str(), "bot_name": self.bot_name, "mode": self.mode_str, "crypto": crypto,
+                "slug": market["slug"], "trade_num_this_window": this_trade_num,
+                "delta_side": "SPLIT" if in_split_zone else delta_side,
+                "delta_value": round(delta_value, 4), "delta_pct": round(delta_pct, 4),
+                "minutes_left_in_window": round(minutes_left, 1),
+            }
 
             if in_split_zone:
                 down_ask, down_is_ask = get_reference_price(market["down_token"])
                 up_ask, up_is_ask = get_reference_price(market["up_token"])
                 if down_ask is None or up_ask is None:
-                    log(f"No price available (neither ask nor bid) for one or both sides "
-                        f"(Down={down_ask}, Up={up_ask}) — genuinely no liquidity at all right now, retrying", crypto)
+                    log(f"No price available for one or both sides — retrying", crypto)
                     time.sleep(MONITOR_INTERVAL)
                     continue
-                trades_this_window += 1
-                position_open = True
-                ref_note = f"(Down priced off {'ask' if down_is_ask else 'bid (no ask available)'}, " \
-                           f"Up priced off {'ask' if up_is_ask else 'bid (no ask available)'})"
+                # Order-book depth confirmation on both legs
+                if not (self._check_order_book_depth(market["down_token"], self.amount) and
+                        self._check_order_book_depth(market["up_token"], self.amount)):
+                    log(f"Order book depth too thin on one or both sides — skipping this signal", crypto)
+                    time.sleep(MONITOR_INTERVAL)
+                    continue
                 log(f"Delta {delta_value:+.2f} ({minutes_left:.0f} min left) is in the moderate-lean zone "
-                    f"(${SPLIT_ZONE_MIN}-${SPLIT_ZONE_MAX}) -> SPLIT both sides {ref_note}", crypto)
-                split_outcome = self._enter_split(market, market["condition_id"], down_ask, up_ask, close_ts, crypto)
-                cumulative_pnl_this_window += float(split_outcome["pnl_usd"] or 0)
-                row = {
-                    "timestamp": ts_str(), "bot_name": self.bot_name, "mode": self.mode_str, "crypto": crypto,
-                    "slug": market["slug"], "trade_num_this_window": trades_this_window,
-                    "delta_side": "SPLIT", "delta_value": round(delta_value, 4), "delta_pct": round(delta_pct, 4),
-                    "minutes_left_in_window": round(minutes_left, 1),
-                    "buy_result": "split", "buy_price": "", "buy_shares": "",
-                    "sell_result": split_outcome["outcome"], "sell_price": "",
-                    "pnl_usd": split_outcome["pnl_usd"], "cumulative_pnl_this_window": round(cumulative_pnl_this_window, 4),
-                    "notes": split_outcome["notes"],
-                }
-                self._record(row)
-                position_open = False
+                    f"(${SPLIT_ZONE_MIN}-${SPLIT_ZONE_MAX}) -> SPLIT both sides (trade {this_trade_num})", crypto)
+                t = threading.Thread(target=self._run_split_trade_thread,
+                                       args=(market, down_ask, up_ask, close_ts, crypto, row_base), daemon=True)
+                t.start()
+                open_threads.append(t)
                 time.sleep(MONITOR_INTERVAL)
                 continue
 
@@ -966,54 +1090,39 @@ class HourlyBot:
             token = market["up_token"] if delta_side == "Up" else market["down_token"]
             observed_price, is_ask = get_reference_price(token)
             if observed_price is None:
-                log(f"No price available (neither ask nor bid) for {delta_side} token — genuinely no "
-                    f"liquidity at all right now, retrying", crypto)
+                log(f"No price available for {delta_side} token — retrying", crypto)
                 time.sleep(MONITOR_INTERVAL)
                 continue
-            trades_this_window += 1
-            position_open = True
+            if not self._check_order_book_depth(token, self.amount):
+                log(f"Order book depth too thin on {delta_side} — skipping this signal", crypto)
+                time.sleep(MONITOR_INTERVAL)
+                continue
+
             book = get_order_book(token)
             observed_bid, _ = best_bid(book)
             spread_at_buy = round(observed_price - observed_bid, 4) if observed_bid is not None else None
             ref_note = "ask" if is_ask else "bid (no ask currently resting)"
-
             zone_label = "extreme/decided" if abs_delta >= SPLIT_ZONE_MAX else "early/uncertain"
-            log(f"Delta signal (trade {trades_this_window}, {minutes_left:.0f} min left, {zone_label} zone): "
+            log(f"Delta signal (trade {this_trade_num}, {minutes_left:.0f} min left, {zone_label} zone): "
                 f"{delta_value:+.2f} ({delta_pct:.4f}%) -> buying {delta_side} @ ~${observed_price} "
                 f"(priced off {ref_note}, spread: ${spread_at_buy})", crypto)
+            row_base["spread_at_buy"] = spread_at_buy
 
-            buy_buffer = BUY_CEILING_BUFFER if is_ask else THIN_MARKET_BUY_BUFFER
-            buy_info = self._attempt_buy(token, observed_price, crypto, buffer_override=buy_buffer)
-            row = {
-                "timestamp": ts_str(), "bot_name": self.bot_name, "mode": self.mode_str, "crypto": crypto,
-                "slug": market["slug"], "trade_num_this_window": trades_this_window,
-                "delta_side": delta_side, "delta_value": round(delta_value, 4), "delta_pct": round(delta_pct, 4),
-                "minutes_left_in_window": round(minutes_left, 1),
-                "buy_result": buy_info["result"], "buy_price": buy_info["price"], "buy_shares": buy_info["shares"],
-                "spread_at_buy": spread_at_buy,
-            }
-            if buy_info["result"] != "bought":
-                row.update({"sell_result": "n/a", "sell_price": "", "pnl_usd": 0,
-                            "cumulative_pnl_this_window": round(cumulative_pnl_this_window, 4), "notes": "no buy fill"})
-                self._record(row)
-                position_open = False
-                time.sleep(MONITOR_INTERVAL)
-                continue
-
-            sell_info = self._watch_for_sell(token, buy_info["price"], buy_info["shares"], crypto, close_ts)
-            cumulative_pnl_this_window += float(sell_info["pnl_usd"] or 0)
-            row.update({
-                "sell_result": sell_info["result"], "sell_price": sell_info["price"],
-                "seconds_to_sell": sell_info.get("seconds_to_sell", ""),
-                "pnl_usd": sell_info["pnl_usd"], "cumulative_pnl_this_window": round(cumulative_pnl_this_window, 4),
-                "notes": sell_info["notes"],
-            })
-            self._record(row)
-            position_open = False
+            t = threading.Thread(target=self._run_single_trade_thread,
+                                   args=(token, observed_price, is_ask, delta_side, close_ts, crypto, row_base,
+                                          window_open_price, symbol),
+                                   daemon=True)
+            t.start()
+            open_threads.append(t)
             time.sleep(MONITOR_INTERVAL)
 
-        log(f"Window closed. Trades this window: {trades_this_window} | "
-            f"Cumulative pnl this window: {'+' if cumulative_pnl_this_window>=0 else ''}${cumulative_pnl_this_window:.2f}", crypto)
+        # Window closing — let any still-open positions resolve on their own
+        # (each thread's own backstop is already capped at close_ts), but
+        # don't block the NEXT window's discovery waiting for them.
+        realized, potential, n_open = self.position_tracker.totals()
+        log(f"Window closed. Trades opened this window: {trades_this_window} | "
+            f"Realized pnl: {'+' if realized>=0 else ''}${realized:.2f}"
+            + (f" | {n_open} position(s) still resolving (potential +${potential:.2f})" if n_open else ""), crypto)
 
     def _record(self, row: dict):
         with self.trades_lock:
