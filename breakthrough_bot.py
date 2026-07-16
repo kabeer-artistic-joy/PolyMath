@@ -166,9 +166,20 @@ def get_window_open_price(symbol: str, window_ts: int):
         )
         r.raise_for_status()
         candles = r.json()
-        return float(candles[0][1]) if candles else None
-    except Exception:
-        return None
+        if candles:
+            return float(candles[0][1])
+        # REAL BUG FIXED HERE: an empty list isn't an exception, so this
+        # never got logged before — confirmed live: querying right at the
+        # exact top of the hour can hit Binance before that hour's candle
+        # has any data yet. Fall back to the current spot price, which at
+        # this early moment is essentially identical to the true window-open
+        # price anyway, rather than abandoning the whole window.
+        log(f"1h candle for window {window_ts} came back empty (likely queried right at the top "
+            f"of the hour, before Binance has data for it yet) — falling back to current spot price")
+        return get_binance_price(symbol)
+    except Exception as e:
+        log(f"get_window_open_price failed for window {window_ts}: {e} — falling back to current spot price")
+        return get_binance_price(symbol)
 
 def _et_slug_candidates(start_ts: int):
     """1-hour markets use an Eastern-Time, human-readable slug — confirmed
@@ -997,6 +1008,7 @@ class HourlyBot:
         trades_this_window = 0
         trade_count_lock = threading.Lock()
         open_threads = []
+        gate_was_closed = False  # tracks state so we only log on CHANGE, not every second
 
         while now_unix() < close_ts:
             if self.stop_event.is_set():
@@ -1008,10 +1020,13 @@ class HourlyBot:
             if self.position_tracker.should_stop_new_entries():
                 realized, potential, n_open = self.position_tracker.totals()
                 if n_open > 0:
-                    log(f"Projected total (${realized + potential:.2f}) already at/above target — "
-                        f"waiting for {n_open} open position(s) to resolve before considering new entries", crypto)
+                    if not gate_was_closed:
+                        log(f"Projected total (${realized + potential:.2f}) already at/above target — "
+                            f"waiting for {n_open} open position(s) to resolve before considering new entries", crypto)
+                        gate_was_closed = True
                 time.sleep(MONITOR_INTERVAL)
                 continue
+            gate_was_closed = False
 
             minutes_left = (close_ts - now_unix()) / 60
             current_btc_price = get_binance_price(symbol) if symbol else None
