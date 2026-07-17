@@ -1414,7 +1414,7 @@ if __name__ == "__main__":
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--live", action="store_true")
-    parser.add_argument("--amount", type=float, default=50.0)
+    parser.add_argument("--amount", type=float, default=80.0)
     args = parser.parse_args()
 
     bot = HourlyBot(dry_run=args.dry_run, amount=args.amount)
