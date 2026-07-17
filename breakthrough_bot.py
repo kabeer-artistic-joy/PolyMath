@@ -102,6 +102,12 @@ WINDOW_SECONDS = 3600            # 1 hour, vs the original bot's 300 (5 min)
 # entry wiped out 14-27 wins worth of profit. The fix isn't a stop-loss (still
 # not adding one back) — it's not entering on noise in the first place.
 MIN_DELTA_PCT_TO_TRUST = 0.04    # raised from 0.01 — roughly $25-28 at current BTC prices, well above
+MIN_DELTA_GROWTH_DURING_OBSERVATION = 10.0  # per explicit request: with $50/trade, require the delta to
+                                               # genuinely GROW by at least this much during observation,
+                                               # not just hold its sign — a real, strengthening move, not
+                                               # a flat, unchanging reading. Starting guess from the stated
+                                               # $10-15 range, needs tuning against real data like every
+                                               # other threshold here.
                                     # the $8-9 noise-level deltas that caused every traced loss
 BUY_CEILING_BUFFER = 0.02        # willing to pay up to (observed price + this) — same as the 5-min bot;
                                     # no reason to cap entry price, the dominant/settled side is exactly
@@ -119,10 +125,9 @@ PROFIT_MARGIN = 0.02             # take-profit target — MUCH tighter than the 
 # force-exit in between; that was still cutting positions off early, just
 # on a timer instead of a price trigger, defeating the point of a long window.
 
-MAX_CONCURRENT_POSITIONS = 4     # REAL FIX: caps how many positions can be open at once, so the bot
-                                    # can't impulse-fire 8-15 entries in the first 60-90 seconds of a
-                                    # window on thin, unconfirmed signals — confirmed live: this exact
-                                    # pattern produced the worst losing windows in the data
+MAX_CONCURRENT_POSITIONS = 1     # STRICT one-at-a-time, per explicit request — with $50/trade the risk per
+                                    # position is much higher, so only one position open at any moment,
+                                    # waiting for full resolution before considering the next entry
 
 # ─── THREE ENTRY ZONES BY |delta from price-to-beat| ────────────────────────
 # Starting thresholds based directly on the examples given (a $50-150 lean
@@ -817,21 +822,33 @@ class HourlyBot:
             f"(potential +${potential_total:.2f})", crypto)
 
     def _confirm_signal_persists(self, symbol: str, window_open_price: float, delta_side: str,
-                                    observe_seconds: float, crypto: str) -> bool:
-        """Short momentum-persistence check: requires the delta to keep
-        pointing the SAME direction for observe_seconds before trusting it —
-        reduces exposure to pure single-tick noise. This does NOT and cannot
-        guarantee the direction won't reverse later; it only filters out
-        signals that don't even survive a few real seconds."""
+                                    observe_seconds: float, crypto: str, delta_at_start: float) -> bool:
+        """Momentum-persistence + growth check: requires the delta to keep
+        pointing the SAME direction AND to have genuinely GROWN by at least
+        MIN_DELTA_GROWTH_DURING_OBSERVATION during the observation window —
+        a flat, unchanging delta that happens to hold its sign is a much
+        weaker signal than one that's actively strengthening. Raised bar per
+        explicit request, given the much larger $50/trade size. This does
+        NOT and cannot guarantee the direction won't reverse later; it only
+        filters out signals that don't show real, continuing momentum."""
         deadline = now_unix() + observe_seconds
+        last_known_delta = delta_at_start
         while now_unix() < deadline:
             time.sleep(0.5)
             check_price = get_binance_price(symbol)
             if check_price is None:
                 continue
-            check_side = "Up" if (check_price - window_open_price) > 0 else "Down"
+            check_delta = check_price - window_open_price
+            check_side = "Up" if check_delta > 0 else "Down"
             if check_side != delta_side:
                 return False
+            last_known_delta = check_delta
+
+        growth = abs(last_known_delta) - abs(delta_at_start)
+        if growth < MIN_DELTA_GROWTH_DURING_OBSERVATION:
+            log(f"Direction held but only grew ${growth:.2f} during observation (need at least "
+                f"${MIN_DELTA_GROWTH_DURING_OBSERVATION}) — not a strong enough continuing move", crypto)
+            return False
         return True
 
     def _check_order_book_depth(self, token: str, needed_shares: float) -> bool:
@@ -1070,8 +1087,8 @@ class HourlyBot:
             observe_secs = LATE_WINDOW_OBSERVATION_SEC if minutes_left <= LATE_WINDOW_CUTOFF_MIN else STANDARD_OBSERVATION_SEC
             log(f"Delta {delta_value:+.2f} ({minutes_left:.0f} min left) — observing {observe_secs}s "
                 f"for persistence before entering", crypto)
-            if not self._confirm_signal_persists(symbol, window_open_price, delta_side, observe_secs, crypto):
-                log(f"Direction did not persist through observation — skipping this signal", crypto)
+            if not self._confirm_signal_persists(symbol, window_open_price, delta_side, observe_secs, crypto, delta_value):
+                log(f"Signal did not pass confirmation — skipping", crypto)
                 time.sleep(MONITOR_INTERVAL)
                 continue
 
@@ -1238,7 +1255,7 @@ if __name__ == "__main__":
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--live", action="store_true")
-    parser.add_argument("--amount", type=float, default=10.0)
+    parser.add_argument("--amount", type=float, default=50.0)
     args = parser.parse_args()
 
     bot = HourlyBot(dry_run=args.dry_run, amount=args.amount)
