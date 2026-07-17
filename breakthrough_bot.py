@@ -94,7 +94,15 @@ ERC20_ABI = [
 
 WINDOW_SECONDS = 3600            # 1 hour, vs the original bot's 300 (5 min)
 
-MIN_DELTA_PCT_TO_TRUST = 0.01    # same validated starting point as the 5-min bot — filters pure noise
+# REAL FIX, based on actual data: a real live session showed every catastrophic
+# loss traced back to entries on a delta of only $8-9 (0.01-0.014%), confirmed
+# by only a 2-second observation — genuinely just tick-to-tick noise, not a
+# real signal. Average win was +$0.37; average loss on a position that never
+# recovered was -$9.99 (single-sided) or -$5.28 (one split leg) — a single bad
+# entry wiped out 14-27 wins worth of profit. The fix isn't a stop-loss (still
+# not adding one back) — it's not entering on noise in the first place.
+MIN_DELTA_PCT_TO_TRUST = 0.04    # raised from 0.01 — roughly $25-28 at current BTC prices, well above
+                                    # the $8-9 noise-level deltas that caused every traced loss
 BUY_CEILING_BUFFER = 0.02        # willing to pay up to (observed price + this) — same as the 5-min bot;
                                     # no reason to cap entry price, the dominant/settled side is exactly
                                     # where we want to be, even at a high price
@@ -111,6 +119,11 @@ PROFIT_MARGIN = 0.02             # take-profit target — MUCH tighter than the 
 # force-exit in between; that was still cutting positions off early, just
 # on a timer instead of a price trigger, defeating the point of a long window.
 
+MAX_CONCURRENT_POSITIONS = 4     # REAL FIX: caps how many positions can be open at once, so the bot
+                                    # can't impulse-fire 8-15 entries in the first 60-90 seconds of a
+                                    # window on thin, unconfirmed signals — confirmed live: this exact
+                                    # pattern produced the worst losing windows in the data
+
 # ─── THREE ENTRY ZONES BY |delta from price-to-beat| ────────────────────────
 # Starting thresholds based directly on the examples given (a $50-150 lean
 # being a real but non-extreme settlement, $300+ being effectively decided) —
@@ -122,7 +135,16 @@ SPLIT_ZONE_MAX = 300.0     # above this: market has essentially decided — spli
 
 LATE_WINDOW_CUTOFF_MIN = 10      # in the final N minutes: NOT a ban — just switch to a brief observation
                                     # window before entering, more caution rather than no entries at all
-LATE_WINDOW_OBSERVATION_SEC = 5.0  # how long to watch the delta hold steady before entering late in the window
+LATE_WINDOW_OBSERVATION_SEC = 30.0  # longer than STANDARD_OBSERVATION_SEC — more caution late in the
+                                       # window, not less; fixed an inversion introduced when the standard
+                                       # observation was raised from 2s to 20s
+
+# REAL FIX: the "normal" 2-second observation used everywhere else was long
+# enough to catch a single tick reversal but nowhere near long enough to
+# distinguish a real, developing trend from ordinary short-term noise —
+# confirmed by every traced loss having passed this exact check. Over a full
+# hour, spending 20-30 real seconds confirming a signal costs nothing.
+STANDARD_OBSERVATION_SEC = 20.0
 
 TARGET_PROFIT_PER_WINDOW = 5.0   # once cumulative profit THIS window reaches this, stop opening new
                                     # positions for the rest of the window, REGARDLESS of time remaining —
@@ -370,8 +392,8 @@ class HourlyBot:
         log(f"Buy: observed price + ${BUY_CEILING_BUFFER} buffer (no fixed ceiling) | timeout {BUY_TIMEOUT_SEC}s")
         log(f"Sell: take-profit entry+${PROFIT_MARGIN} | NO stop-loss, NO backstop — holds to window "
             f"close and resolves at real settlement if target never hits")
-        log(f"MULTIPLE concurrent positions allowed | momentum-persistence + order-book-depth "
-            f"confirmation on every entry | last {LATE_WINDOW_CUTOFF_MIN} min: longer observation")
+        log(f"Max {MAX_CONCURRENT_POSITIONS} concurrent positions | {STANDARD_OBSERVATION_SEC:.0f}s momentum-persistence "
+            f"+ order-book-depth confirmation on every entry | last {LATE_WINDOW_CUTOFF_MIN} min: {LATE_WINDOW_OBSERVATION_SEC:.0f}s observation")
         log(f"Zones by |delta|: <${SPLIT_ZONE_MIN} or >=${SPLIT_ZONE_MAX} -> single-sided dominant side | "
             f"${SPLIT_ZONE_MIN}-${SPLIT_ZONE_MAX} -> SPLIT both sides")
         log(f"Session target: stop opening NEW positions once realized + potential (from open positions) "
@@ -992,6 +1014,7 @@ class HourlyBot:
         trade_count_lock = threading.Lock()
         open_threads = []
         gate_was_closed = False  # tracks state so we only log on CHANGE, not every second
+        concurrent_cap_was_hit = False  # same log-on-change pattern for the concurrent-position cap
 
         while now_unix() < close_ts:
             if self.stop_event.is_set():
@@ -1010,6 +1033,20 @@ class HourlyBot:
                 time.sleep(MONITOR_INTERVAL)
                 continue
             gate_was_closed = False
+
+            # REAL FIX: caps concurrent open positions so the bot can't
+            # impulse-fire many entries in the first minute of a window on
+            # thin, unconfirmed signals — confirmed live as the exact pattern
+            # behind the worst losing windows.
+            _, _, n_open_now = self.position_tracker.totals()
+            if n_open_now >= MAX_CONCURRENT_POSITIONS:
+                if not concurrent_cap_was_hit:
+                    log(f"At the concurrent-position cap ({MAX_CONCURRENT_POSITIONS}) — waiting for one "
+                        f"to resolve before considering new entries", crypto)
+                    concurrent_cap_was_hit = True
+                time.sleep(MONITOR_INTERVAL)
+                continue
+            concurrent_cap_was_hit = False
 
             minutes_left = (close_ts - now_unix()) / 60
             current_btc_price = get_binance_price(symbol) if symbol else None
@@ -1030,7 +1067,7 @@ class HourlyBot:
             # early on (more time available either way). This reduces
             # exposure to pure single-tick noise; it does not and cannot
             # guarantee the direction won't reverse later.
-            observe_secs = LATE_WINDOW_OBSERVATION_SEC if minutes_left <= LATE_WINDOW_CUTOFF_MIN else 2.0
+            observe_secs = LATE_WINDOW_OBSERVATION_SEC if minutes_left <= LATE_WINDOW_CUTOFF_MIN else STANDARD_OBSERVATION_SEC
             log(f"Delta {delta_value:+.2f} ({minutes_left:.0f} min left) — observing {observe_secs}s "
                 f"for persistence before entering", crypto)
             if not self._confirm_signal_persists(symbol, window_open_price, delta_side, observe_secs, crypto):
