@@ -138,37 +138,24 @@ SPLIT_ZONE_MIN = 50.0      # below this: too close to a coin-flip to split — s
 SPLIT_ZONE_MAX = 300.0     # above this: market has essentially decided — split the losing side would
                               # sit there forever, single-sided dominant-side only
 
-# ─── MARKET-SENTIMENT CONFIRMATION ───────────────────────────────────────────
-# HONEST CAVEAT: this whole section is a hypothesis built directly from the
-# user's own stated market observation, NOT something independently verified
-# against real data. It needs the same tuning-against-real-results treatment
-# as every other threshold here — it's a real, testable model, not a proven rule.
-#
-# The core idea: the market's OWN pricing is an independent signal, separate
-# from our own delta calculation — every other trader's money is already
-# voting on how confident this move is. If delta is large but the price
-# HASN'T moved to match, that means the market hasn't confirmed the move yet.
-# Anchor points taken directly from the examples given: delta~$50 -> prices
-# still floating near 0.55/0.45 (genuinely uncertain), delta~$100 -> price
-# ~0.85 (market has reacted strongly, real confirmation).
-PRICE_DELTA_CURVE = [
-    (0, 0.50), (50, 0.55), (100, 0.85), (300, 0.97),
-]
-PRICE_CONFIRMATION_TOLERANCE = 0.05  # how far below the expected curve the actual price is allowed to be
-                                        # before we treat it as "market hasn't confirmed this move yet"
+# REMOVED: the market-sentiment price curve and the retrospective liveliness
+# check that used to live here. Both were disproven by real data — the price
+# curve demanded prices the real market almost never reaches (confirmed:
+# delta=104 predicted $0.85, real price was $0.66), and the retrospective
+# check demanded evidence of movement in 30 seconds that the actual position
+# has the rest of the hour to accomplish. Both ended up blocking the large
+# majority of legitimate opportunities. Removed rather than re-tuned, since
+# the underlying idea (require proof before committing) was sound but the
+# specific implementation was actively harmful.
 
 # SPLIT price-band sanity check: confirmed live — a split entered at
 # Down=$0.918/Up=$0.09 lost $3.50 because the cheap leg had almost no real
 # room to gain $0.02 (it was already priced as a near-certain loser). Both
-# legs need a genuine chance for a split to make sense.
+# legs need a genuine chance for a split to make sense. This one IS kept —
+# it directly targets a confirmed real failure and hasn't shown the same
+# over-blocking problem.
 MIN_SPLIT_LEG_PRICE = 0.15
 MAX_SPLIT_LEG_PRICE = 0.85
-
-# Retrospective liveliness check: confirmed via real data that price-curve
-# and delta-size checks alone don't catch "one leg just isn't moving" —
-# both real losses looked entirely reasonable by those checks. This directly
-# observes real, current movement instead. Starting duration, needs tuning.
-RETROSPECTIVE_CHECK_SECONDS = 30.0
 
 LATE_WINDOW_CUTOFF_MIN = 10      # in the final N minutes: NOT a ban — just switch to a brief observation
                                     # window before entering, more caution rather than no entries at all
@@ -346,24 +333,6 @@ def get_reference_price(token_id: str):
         return bid, False
     return None, None
 
-def expected_price_for_delta(abs_delta: float) -> float:
-    """Piecewise-linear interpolation through PRICE_DELTA_CURVE — a rough
-    model of what the market's own pricing SHOULD look like for a given
-    |delta|, built directly from the anchor points given (delta~$50 -> still
-    uncertain ~0.55, delta~$100 -> market has reacted strongly ~0.85). This
-    is a hypothesis to test against real data, not a validated formula."""
-    points = PRICE_DELTA_CURVE
-    if abs_delta <= points[0][0]:
-        return points[0][1]
-    if abs_delta >= points[-1][0]:
-        return points[-1][1]
-    for i in range(len(points) - 1):
-        x0, y0 = points[i]
-        x1, y1 = points[i + 1]
-        if x0 <= abs_delta <= x1:
-            fraction = (abs_delta - x0) / (x1 - x0)
-            return y0 + fraction * (y1 - y0)
-    return points[-1][1]  # unreachable, safety fallback
 
 # ─── PERSISTENT CSV LOG ──────────────────────────────────────────────────────
 CSV_FIELDS = [
@@ -452,9 +421,8 @@ class HourlyBot:
             f"+ order-book-depth confirmation on every entry | last {LATE_WINDOW_CUTOFF_MIN} min: {LATE_WINDOW_OBSERVATION_SEC:.0f}s observation")
         log(f"Zones by |delta|: <${SPLIT_ZONE_MIN} or >=${SPLIT_ZONE_MAX} -> single-sided dominant side | "
             f"${SPLIT_ZONE_MIN}-${SPLIT_ZONE_MAX} -> SPLIT both sides")
-        log(f"Market-sentiment confirmation: real price must be within ${PRICE_CONFIRMATION_TOLERANCE} of "
-            f"the expected curve for this delta (hypothesis, needs real-data tuning) | Split legs must be "
-            f"${MIN_SPLIT_LEG_PRICE}-${MAX_SPLIT_LEG_PRICE}")
+        log(f"Split legs must be ${MIN_SPLIT_LEG_PRICE}-${MAX_SPLIT_LEG_PRICE} (confirmed live: prevents "
+            f"splitting when one leg has no real room left to hit its target)")
         log(f"Session target: stop opening NEW positions once realized + potential (from open positions) "
             f"reaches +${TARGET_PROFIT_PER_WINDOW} — already-open positions still resolve independently")
         log(f"Trade log: {self.logger.path}")
@@ -915,41 +883,6 @@ class HourlyBot:
             return False
         return bid_size >= needed_shares * 0.5  # at least half our intended size resting as real interest
 
-    def _check_both_sides_actively_repricing(self, down_token: str, up_token: str,
-                                                down_start: float, up_start: float,
-                                                duration: float, crypto: str) -> bool:
-        """Directly observes whether BOTH sides are actively moving right
-        now, rather than inferring it from delta size or a static price
-        curve. Confirmed by real data: both actual losses had delta and
-        price-curve readings that looked entirely reasonable, yet one leg
-        never moved enough to hit its target — this check looks at real,
-        current movement instead of a proxy for it. Tracks each side's own
-        best movement toward its target during the window; requires BOTH
-        to show at least half of PROFIT_MARGIN worth of real movement."""
-        down_best = down_start
-        up_best = up_start
-        deadline = now_unix() + duration
-        while now_unix() < deadline:
-            time.sleep(1.0)
-            down_bid, _ = best_bid(get_order_book(down_token))
-            up_bid, _ = best_bid(get_order_book(up_token))
-            if down_bid is not None and down_bid > down_best:
-                down_best = down_bid
-            if up_bid is not None and up_bid > up_best:
-                up_best = up_bid
-
-        down_movement = down_best - down_start
-        up_movement = up_best - up_start
-        required = PROFIT_MARGIN * 0.5
-        if down_movement < required or up_movement < required:
-            log(f"Retrospective check: Down moved ${down_movement:.3f}, Up moved ${up_movement:.3f} "
-                f"during {duration:.0f}s (need ${required} on both) — not genuinely repricing on both "
-                f"sides right now, skipping", crypto)
-            return False
-        log(f"Retrospective check passed: Down moved ${down_movement:.3f}, Up moved ${up_movement:.3f} "
-            f"during {duration:.0f}s — real, active two-sided movement confirmed", crypto)
-        return True
-
     def _enter_split(self, market: dict, condition_id: str, down_ask: float, up_ask: float,
                        close_ts: float, crypto: str, window_open_price: float) -> dict:
         """Buys BOTH sides via split and places a take-profit sell on each —
@@ -1228,31 +1161,6 @@ class HourlyBot:
                         f"little real room to hit its own target, skipping this split", crypto)
                     time.sleep(MONITOR_INTERVAL)
                     continue
-                # Market-sentiment confirmation: does the market's OWN pricing agree
-                # this delta is real? See PRICE_DELTA_CURVE definition for the caveat.
-                expected = expected_price_for_delta(abs_delta)
-                if leading_price < expected - PRICE_CONFIRMATION_TOLERANCE:
-                    log(f"Market pricing (leading side ${leading_price}) hasn't caught up to what delta "
-                        f"${abs_delta:.0f} would suggest (expected ~${expected:.2f}) — market hasn't "
-                        f"confirmed this move yet, skipping", crypto)
-                    time.sleep(MONITOR_INTERVAL)
-                    continue
-
-                # Retrospective check: directly observe real, active repricing on
-                # BOTH sides before committing capital, rather than inferring it.
-                if not self._check_both_sides_actively_repricing(
-                        market["down_token"], market["up_token"], down_ask, up_ask,
-                        RETROSPECTIVE_CHECK_SECONDS, crypto):
-                    time.sleep(MONITOR_INTERVAL)
-                    continue
-
-                # Refresh prices since real time passed during the retrospective check
-                down_ask, down_is_ask = get_reference_price(market["down_token"])
-                up_ask, up_is_ask = get_reference_price(market["up_token"])
-                if down_ask is None or up_ask is None:
-                    log(f"Price disappeared after retrospective check — skipping", crypto)
-                    time.sleep(MONITOR_INTERVAL)
-                    continue
 
                 with trade_count_lock:
                     trades_this_window += 1
@@ -1264,8 +1172,7 @@ class HourlyBot:
                     "minutes_left_in_window": round(minutes_left, 1),
                 }
                 log(f"Delta {delta_value:+.2f} ({minutes_left:.0f} min left) is in the moderate-lean zone "
-                    f"(${SPLIT_ZONE_MIN}-${SPLIT_ZONE_MAX}), prices confirm (${leading_price} vs expected "
-                    f"${expected:.2f}), real repricing confirmed -> SPLIT both sides (trade {this_trade_num})", crypto)
+                    f"(${SPLIT_ZONE_MIN}-${SPLIT_ZONE_MAX}) -> SPLIT both sides (trade {this_trade_num})", crypto)
                 t = threading.Thread(target=self._run_split_trade_thread,
                                        args=(market, down_ask, up_ask, close_ts, crypto, row_base, window_open_price),
                                        daemon=True)
@@ -1288,17 +1195,6 @@ class HourlyBot:
                 time.sleep(MONITOR_INTERVAL)
                 continue
 
-            # Same market-sentiment confirmation for single-sided entries — just
-            # because a side is priced high doesn't mean it'll keep moving;
-            # confirm the market's own pricing actually matches this delta.
-            expected = expected_price_for_delta(abs_delta)
-            if observed_price < expected - PRICE_CONFIRMATION_TOLERANCE:
-                log(f"Market pricing (${observed_price}) hasn't caught up to what delta ${abs_delta:.0f} "
-                    f"would suggest (expected ~${expected:.2f}) — market hasn't confirmed this move yet, "
-                    f"skipping", crypto)
-                time.sleep(MONITOR_INTERVAL)
-                continue
-
             with trade_count_lock:
                 trades_this_window += 1
                 this_trade_num = trades_this_window
@@ -1314,8 +1210,7 @@ class HourlyBot:
             spread_at_buy = round(observed_price - observed_bid, 4) if observed_bid is not None else None
             ref_note = "ask" if is_ask else "bid (no ask currently resting)"
             zone_label = "extreme/decided" if abs_delta >= SPLIT_ZONE_MAX else "early/uncertain"
-            log(f"Delta signal (trade {this_trade_num}, {minutes_left:.0f} min left, {zone_label} zone), "
-                f"prices confirm (${observed_price} vs expected ${expected:.2f}): "
+            log(f"Delta signal (trade {this_trade_num}, {minutes_left:.0f} min left, {zone_label} zone): "
                 f"{delta_value:+.2f} ({delta_pct:.4f}%) -> buying {delta_side} @ ~${observed_price} "
                 f"(priced off {ref_note}, spread: ${spread_at_buy})", crypto)
             row_base["spread_at_buy"] = spread_at_buy
