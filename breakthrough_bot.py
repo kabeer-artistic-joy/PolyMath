@@ -138,25 +138,6 @@ SPLIT_ZONE_MIN = 50.0      # below this: too close to a coin-flip to split — s
 SPLIT_ZONE_MAX = 300.0     # above this: market has essentially decided — split the losing side would
                               # sit there forever, single-sided dominant-side only
 
-# REMOVED: the market-sentiment price curve and the retrospective liveliness
-# check that used to live here. Both were disproven by real data — the price
-# curve demanded prices the real market almost never reaches (confirmed:
-# delta=104 predicted $0.85, real price was $0.66), and the retrospective
-# check demanded evidence of movement in 30 seconds that the actual position
-# has the rest of the hour to accomplish. Both ended up blocking the large
-# majority of legitimate opportunities. Removed rather than re-tuned, since
-# the underlying idea (require proof before committing) was sound but the
-# specific implementation was actively harmful.
-
-# SPLIT price-band sanity check: confirmed live — a split entered at
-# Down=$0.918/Up=$0.09 lost $3.50 because the cheap leg had almost no real
-# room to gain $0.02 (it was already priced as a near-certain loser). Both
-# legs need a genuine chance for a split to make sense. This one IS kept —
-# it directly targets a confirmed real failure and hasn't shown the same
-# over-blocking problem.
-MIN_SPLIT_LEG_PRICE = 0.15
-MAX_SPLIT_LEG_PRICE = 0.85
-
 LATE_WINDOW_CUTOFF_MIN = 10      # in the final N minutes: NOT a ban — just switch to a brief observation
                                     # window before entering, more caution rather than no entries at all
 LATE_WINDOW_OBSERVATION_SEC = 30.0  # longer than STANDARD_OBSERVATION_SEC — more caution late in the
@@ -333,7 +314,6 @@ def get_reference_price(token_id: str):
         return bid, False
     return None, None
 
-
 # ─── PERSISTENT CSV LOG ──────────────────────────────────────────────────────
 CSV_FIELDS = [
     "timestamp", "bot_name", "mode", "crypto", "slug", "trade_num_this_window",
@@ -421,8 +401,6 @@ class HourlyBot:
             f"+ order-book-depth confirmation on every entry | last {LATE_WINDOW_CUTOFF_MIN} min: {LATE_WINDOW_OBSERVATION_SEC:.0f}s observation")
         log(f"Zones by |delta|: <${SPLIT_ZONE_MIN} or >=${SPLIT_ZONE_MAX} -> single-sided dominant side | "
             f"${SPLIT_ZONE_MIN}-${SPLIT_ZONE_MAX} -> SPLIT both sides")
-        log(f"Split legs must be ${MIN_SPLIT_LEG_PRICE}-${MAX_SPLIT_LEG_PRICE} (confirmed live: prevents "
-            f"splitting when one leg has no real room left to hit its target)")
         log(f"Session target: stop opening NEW positions once realized + potential (from open positions) "
             f"reaches +${TARGET_PROFIT_PER_WINDOW} — already-open positions still resolve independently")
         log(f"Trade log: {self.logger.path}")
@@ -1069,20 +1047,6 @@ class HourlyBot:
                         log(f"Projected total (${realized + potential:.2f}) already at/above target — "
                             f"waiting for {n_open} open position(s) to resolve before considering new entries", crypto)
                         gate_was_closed = True
-                    time.sleep(MONITOR_INTERVAL)
-                    continue
-                # REAL FIX, per explicit request: target achieved and nothing left
-                # open — sleep until close to window end instead of polling every
-                # second for the rest of the hour with nothing left to do.
-                sleep_until = close_ts - 60  # wake up 1 minute before the window closes
-                remaining = sleep_until - now_unix()
-                if remaining > 0:
-                    if not gate_was_closed:
-                        log(f"Target achieved (${realized:.2f}) with nothing left open — sleeping until "
-                            f"1 min before this window closes", crypto)
-                        gate_was_closed = True
-                    time.sleep(min(remaining, 60))
-                    continue
                 time.sleep(MONITOR_INTERVAL)
                 continue
             gate_was_closed = False
@@ -1138,6 +1102,18 @@ class HourlyBot:
             abs_delta = abs(delta_value)
             in_split_zone = SPLIT_ZONE_MIN <= abs_delta < SPLIT_ZONE_MAX
 
+            with trade_count_lock:
+                trades_this_window += 1
+                this_trade_num = trades_this_window
+
+            row_base = {
+                "timestamp": ts_str(), "bot_name": self.bot_name, "mode": self.mode_str, "crypto": crypto,
+                "slug": market["slug"], "trade_num_this_window": this_trade_num,
+                "delta_side": "SPLIT" if in_split_zone else delta_side,
+                "delta_value": round(delta_value, 4), "delta_pct": round(delta_pct, 4),
+                "minutes_left_in_window": round(minutes_left, 1),
+            }
+
             if in_split_zone:
                 down_ask, down_is_ask = get_reference_price(market["down_token"])
                 up_ask, up_is_ask = get_reference_price(market["up_token"])
@@ -1151,26 +1127,6 @@ class HourlyBot:
                     log(f"Order book depth too thin on one or both sides — skipping this signal", crypto)
                     time.sleep(MONITOR_INTERVAL)
                     continue
-                # REAL FIX: confirmed live — a split entered at Down=$0.918/Up=$0.09
-                # lost $3.50 because the cheap leg had almost no real room to gain
-                # $0.02. Both legs need a genuine chance for a split to make sense.
-                leading_price = max(down_ask, up_ask)
-                trailing_price = min(down_ask, up_ask)
-                if trailing_price < MIN_SPLIT_LEG_PRICE or leading_price > MAX_SPLIT_LEG_PRICE:
-                    log(f"Split prices too extreme (Down=${down_ask}, Up=${up_ask}) — the cheap leg has "
-                        f"little real room to hit its own target, skipping this split", crypto)
-                    time.sleep(MONITOR_INTERVAL)
-                    continue
-
-                with trade_count_lock:
-                    trades_this_window += 1
-                    this_trade_num = trades_this_window
-                row_base = {
-                    "timestamp": ts_str(), "bot_name": self.bot_name, "mode": self.mode_str, "crypto": crypto,
-                    "slug": market["slug"], "trade_num_this_window": this_trade_num,
-                    "delta_side": "SPLIT", "delta_value": round(delta_value, 4), "delta_pct": round(delta_pct, 4),
-                    "minutes_left_in_window": round(minutes_left, 1),
-                }
                 log(f"Delta {delta_value:+.2f} ({minutes_left:.0f} min left) is in the moderate-lean zone "
                     f"(${SPLIT_ZONE_MIN}-${SPLIT_ZONE_MAX}) -> SPLIT both sides (trade {this_trade_num})", crypto)
                 t = threading.Thread(target=self._run_split_trade_thread,
@@ -1194,16 +1150,6 @@ class HourlyBot:
                 log(f"Order book depth too thin on {delta_side} — skipping this signal", crypto)
                 time.sleep(MONITOR_INTERVAL)
                 continue
-
-            with trade_count_lock:
-                trades_this_window += 1
-                this_trade_num = trades_this_window
-            row_base = {
-                "timestamp": ts_str(), "bot_name": self.bot_name, "mode": self.mode_str, "crypto": crypto,
-                "slug": market["slug"], "trade_num_this_window": this_trade_num,
-                "delta_side": delta_side, "delta_value": round(delta_value, 4), "delta_pct": round(delta_pct, 4),
-                "minutes_left_in_window": round(minutes_left, 1),
-            }
 
             book = get_order_book(token)
             observed_bid, _ = best_bid(book)
@@ -1309,8 +1255,10 @@ if __name__ == "__main__":
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--live", action="store_true")
-    parser.add_argument("--amount", type=float, default=80.0)
+    parser.add_argument("--amount", type=float, default=50.0)
     args = parser.parse_args()
 
     bot = HourlyBot(dry_run=args.dry_run, amount=args.amount)
     bot.run()
+
+
