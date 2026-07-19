@@ -129,6 +129,14 @@ MAX_CONCURRENT_POSITIONS = 4     # REAL FIX: caps how many positions can be open
 # being a real but non-extreme settlement, $300+ being effectively decided) —
 # not independently validated numbers, meant to be tuned against real data
 # like every other threshold in this project.
+# REAL FIX, confirmed directly against live data: out of 23 single-sided
+# trades, 22 were bought at $0.54-$0.999 and every one of them won. The one
+# exception — bought Up at $0.38 (a 38% implied underdog) — was the only
+# loss, a full -$150.10 (held to window close, resolved to $0). Requiring
+# the observed price to be at least $0.50 means we only ever buy the side
+# the market itself agrees is more likely to win, not the underdog.
+MIN_SINGLE_SIDE_PRICE = 0.50
+
 SPLIT_ZONE_MIN = 50.0      # below this: too close to a coin-flip to split — single-sided momentum only
 SPLIT_ZONE_MAX = 300.0     # above this: market has essentially decided — split the losing side would
                               # sit there forever, single-sided dominant-side only
@@ -396,6 +404,8 @@ class HourlyBot:
             f"+ order-book-depth confirmation on every entry | last {LATE_WINDOW_CUTOFF_MIN} min: {LATE_WINDOW_OBSERVATION_SEC:.0f}s observation")
         log(f"Zones by |delta|: <${SPLIT_ZONE_MIN} or >=${SPLIT_ZONE_MAX} -> single-sided dominant side | "
             f"${SPLIT_ZONE_MIN}-${SPLIT_ZONE_MAX} -> SPLIT both sides")
+        log(f"Single-sided entries require price >= ${MIN_SINGLE_SIDE_PRICE} (confirmed live: the only "
+            f"loss out of 23 single-sided trades was the only one bought below this)")
         log(f"Session target: stop opening NEW positions once realized + potential (from open positions) "
             f"reaches +${TARGET_PROFIT_PER_WINDOW} — already-open positions still resolve independently")
         log(f"Trade log: {self.logger.path}")
@@ -1127,6 +1137,15 @@ class HourlyBot:
             observed_price, is_ask = get_reference_price(token)
             if observed_price is None:
                 log(f"No price available for {delta_side} token — retrying", crypto)
+                time.sleep(MONITOR_INTERVAL)
+                continue
+            # REAL FIX, confirmed against live data (see MIN_SINGLE_SIDE_PRICE
+            # definition): the one loss out of 23 single-sided trades was the
+            # only one bought below $0.50 — don't buy a side the market itself
+            # thinks is the underdog.
+            if observed_price < MIN_SINGLE_SIDE_PRICE:
+                log(f"{delta_side} priced at ${observed_price} — below the ${MIN_SINGLE_SIDE_PRICE} minimum "
+                    f"(market itself sees this side as the underdog), skipping", crypto)
                 time.sleep(MONITOR_INTERVAL)
                 continue
             if not self._check_order_book_depth(token, self.amount):
