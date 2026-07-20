@@ -137,6 +137,24 @@ MAX_CONCURRENT_POSITIONS = 4     # REAL FIX: caps how many positions can be open
 # the market itself agrees is more likely to win, not the underdog.
 MIN_SINGLE_SIDE_PRICE = 0.50
 
+# REAL FIX, confirmed against live time-to-profit data: every single winning
+# single-sided trade hit its take-profit within 141.6 seconds (avg ~90s).
+# Both real losses held 54-58 MINUTES with zero progress toward target. This
+# is NOT a price-triggered stop-loss — it never looks at how far price has
+# moved, only at how long we've been waiting. A genuine signal resolves
+# fast; if it hasn't in 180s, the data says it likely isn't going to. Applies
+# ONLY to single-sided trades — splits are structurally different (bounded
+# risk on the cheap leg) and are explicitly NOT subject to this.
+MAX_HOLD_SECONDS = 240
+
+# Daily profit target, tracked across ALL windows (not per-window). Once
+# reached, stop opening new positions until the next UTC day — but a
+# subsequent loss reduces the running total and reopens the gate immediately,
+# same self-correcting mechanism as the per-window target.
+DAILY_PROFIT_TARGET = 50.0
+DAILY_EARLY_WAKE_MINUTES = 5  # start monitoring again this many minutes before the next UTC day,
+                                 # so the bot is ready right as the new day's trading opens
+
 SPLIT_ZONE_MIN = 50.0      # below this: too close to a coin-flip to split — single-sided momentum only
 SPLIT_ZONE_MAX = 300.0     # above this: market has essentially decided — split the losing side would
                               # sit there forever, single-sided dominant-side only
@@ -388,6 +406,9 @@ class HourlyBot:
         self.stop_event = threading.Event()
         self.trades = []
         self.trades_lock = threading.Lock()
+        self.daily_lock = threading.Lock()
+        self.daily_pnl = 0.0
+        self.current_day = None  # set on first use; a UTC date, resets daily_pnl when it changes
         self.logger = TradeLogger(self.bot_name)
         self.client = None
         if not dry_run:
@@ -398,16 +419,21 @@ class HourlyBot:
         log(f"Direction: delta-from-price-to-beat only (min {MIN_DELTA_PCT_TO_TRUST}% to trust) — "
             f"same signal as the 5-min bot, always betting the leaning/dominant side")
         log(f"Buy: observed price + ${BUY_CEILING_BUFFER} buffer (no fixed ceiling) | timeout {BUY_TIMEOUT_SEC}s")
-        log(f"Sell: take-profit entry+${PROFIT_MARGIN} | NO stop-loss, NO backstop — holds to window "
-            f"close and resolves at real settlement if target never hits")
+        log(f"Sell: take-profit entry+${PROFIT_MARGIN} | NO price stop-loss anywhere | splits hold to "
+            f"window close and resolve at real settlement if never hit (single-sided: see max-hold line below)")
         log(f"Max {MAX_CONCURRENT_POSITIONS} concurrent positions | {STANDARD_OBSERVATION_SEC:.0f}s momentum-persistence "
             f"+ order-book-depth confirmation on every entry | last {LATE_WINDOW_CUTOFF_MIN} min: {LATE_WINDOW_OBSERVATION_SEC:.0f}s observation")
         log(f"Zones by |delta|: <${SPLIT_ZONE_MIN} or >=${SPLIT_ZONE_MAX} -> single-sided dominant side | "
             f"${SPLIT_ZONE_MIN}-${SPLIT_ZONE_MAX} -> SPLIT both sides")
         log(f"Single-sided entries require price >= ${MIN_SINGLE_SIDE_PRICE} (confirmed live: the only "
             f"loss out of 23 single-sided trades was the only one bought below this)")
+        log(f"Single-sided max hold: {MAX_HOLD_SECONDS}s then force-exit (confirmed live: every real win "
+            f"hit within 142s, both real losses sat idle 54-58 min) — time-based, NOT a price stop-loss. "
+            f"Splits are never subject to this.")
         log(f"Session target: stop opening NEW positions once realized + potential (from open positions) "
             f"reaches +${TARGET_PROFIT_PER_WINDOW} — already-open positions still resolve independently")
+        log(f"Daily profit target: +${DAILY_PROFIT_TARGET} across all windows, tracked by REALIZED pnl only "
+            f"— a later loss reduces the running total and reopens new entries automatically")
         log(f"Trade log: {self.logger.path}")
         log("=" * 70)
 
@@ -596,14 +622,17 @@ class HourlyBot:
                 f"resolving at real settlement", crypto)
             take_profit_price = None
 
-        # NO BACKSTOP. By explicit request: a position exits ONLY two ways —
-        # its take-profit order fills, or the window closes and it resolves
-        # at the real market outcome. No time-based force-exit in between,
-        # since that was still cutting positions off before the window's
-        # actual time was used, just on a timer instead of a price trigger.
+        # REAL FIX, confirmed against live time-to-profit data: this used to
+        # hold unconditionally to window close with no exit besides
+        # take-profit. Every real win hit in under 142s; both real losses sat
+        # for 54-58 minutes with zero progress. MAX_HOLD_SECONDS force-exits
+        # via the same proven guaranteed-sell escalation used elsewhere — a
+        # TIME cap, not a price-triggered stop-loss, and applies only here,
+        # never to split positions.
         log(f"Take-profit: {'$'+str(take_profit_price) if take_profit_price else 'N/A (no room)'} "
-            f"(+${PROFIT_MARGIN}) | holds to window close if never hit | NO stop-loss, NO backstop", crypto)
+            f"(+${PROFIT_MARGIN}) | max hold {MAX_HOLD_SECONDS}s, then force-exit | NO price stop-loss", crypto)
         buy_time = now_unix()
+        hold_deadline = min(close_ts, buy_time + MAX_HOLD_SECONDS)
 
         if not self.dry_run:
             from py_clob_client_v2 import AssetType, BalanceAllowanceParams
@@ -643,7 +672,7 @@ class HourlyBot:
                     log(f"Could not place take-profit order ({e}) — this position will resolve at "
                         f"window close instead", crypto)
 
-            while now_unix() < close_ts:
+            while now_unix() < hold_deadline:
                 if self.stop_event.is_set():
                     break
                 if tp_order_id is not None:
@@ -658,17 +687,21 @@ class HourlyBot:
                         pass
                 time.sleep(POLL_INTERVAL_SLOW)
 
-            # Window closed without hitting target — cancel the resting order
-            # and resolve at the REAL market outcome, not a forced exit price.
             if tp_order_id is not None:
                 try:
                     self.client.cancel_order(OrderPayload(orderID=tp_order_id))
                 except Exception:
                     pass
-            return self._resolve_single_at_settlement(buy_price, shares, side, window_open_price, symbol, crypto)
+            if now_unix() >= close_ts:
+                # Window closed exactly as the hold deadline was reached — resolve at real settlement
+                return self._resolve_single_at_settlement(buy_price, shares, side, window_open_price, symbol, crypto)
+            log(f"{MAX_HOLD_SECONDS}s max hold reached, take-profit never hit — force-exiting", crypto)
+            exit_result = self._guaranteed_sell(token, shares, crypto)
+            pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
+            return {**exit_result, "pnl_usd": pnl, "notes": f"{MAX_HOLD_SECONDS}s max hold reached, force-exit (no price stop-loss)"}
 
         # DRY-RUN
-        while now_unix() < close_ts:
+        while now_unix() < hold_deadline:
             book = get_order_book(token)
             bid_price, bid_size = best_bid(book)
             if bid_price is not None and bid_size >= shares and take_profit_price is not None:
@@ -679,7 +712,12 @@ class HourlyBot:
                     return {"result": "sold_take_profit", "price": take_profit_price, "pnl_usd": pnl,
                             "notes": "take_profit hit", "seconds_to_sell": elapsed}
             time.sleep(POLL_INTERVAL_SLOW)
-        return self._resolve_single_at_settlement(buy_price, shares, side, window_open_price, symbol, crypto)
+        if now_unix() >= close_ts:
+            return self._resolve_single_at_settlement(buy_price, shares, side, window_open_price, symbol, crypto)
+        log(f"{MAX_HOLD_SECONDS}s max hold reached, take-profit never hit — force-exiting", crypto)
+        exit_result = self._guaranteed_sell(token, shares, crypto)
+        pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
+        return {**exit_result, "pnl_usd": pnl, "notes": f"{MAX_HOLD_SECONDS}s max hold reached, force-exit (no price stop-loss)"}
 
     def _resolve_single_at_settlement(self, buy_price: float, shares: float, side: str,
                                          window_open_price: float, symbol: str, crypto: str) -> dict:
@@ -789,6 +827,7 @@ class HourlyBot:
                                             delta_side, window_open_price, symbol)
         actual_pnl = float(sell_info["pnl_usd"] or 0)
         self.position_tracker.resolve(pos_id, actual_pnl)
+        self._update_daily_pnl(actual_pnl)
         realized, potential_total, n_open = self.position_tracker.totals()
 
         row.update({
@@ -813,6 +852,7 @@ class HourlyBot:
                                             window_open_price)
         actual_pnl = float(split_outcome["pnl_usd"] or 0)
         self.position_tracker.resolve(pos_id, actual_pnl)
+        self._update_daily_pnl(actual_pnl)
         realized, potential_total, n_open = self.position_tracker.totals()
 
         row = dict(row_base)
@@ -965,6 +1005,19 @@ class HourlyBot:
         crypto = MARKETS[slug_prefix]
         close_ts = start_ts + WINDOW_SECONDS
         symbol = SYMBOLS.get(crypto)
+
+        # Daily profit target, per explicit request: once reached, skip
+        # entire windows (no market search, no monitoring at all) until
+        # close to the next UTC day — except we still fully monitor the
+        # LAST hour of the day, since that's the only window where "close
+        # to the next day" can actually occur mid-window.
+        self._check_daily_reset()
+        is_last_hour_of_day = (close_ts % 86400 == 0)
+        if self._daily_target_met() and not is_last_hour_of_day:
+            log(f"Daily profit target (${DAILY_PROFIT_TARGET}) already reached (${self.daily_pnl:.2f}) — "
+                f"skipping this window entirely", crypto)
+            return
+
         market = None
         find_deadline = now_unix() + 15  # generous — the new token-validation logic does more HTTP
                                             # calls per attempt (checking each candidate market's tokens
@@ -1025,10 +1078,25 @@ class HourlyBot:
         open_threads = []
         gate_was_closed = False  # tracks state so we only log on CHANGE, not every second
         concurrent_cap_was_hit = False  # same log-on-change pattern for the concurrent-position cap
+        daily_gate_was_closed = False  # same pattern for the daily target gate
 
         while now_unix() < close_ts:
             if self.stop_event.is_set():
                 break
+
+            # Daily profit target, checked every iteration since we may be in
+            # the last hour of the day, where "close enough to next day" can
+            # become true mid-window. A loss anywhere reduces daily_pnl and
+            # can reopen this gate automatically, same self-correcting
+            # pattern as the per-window target below.
+            if self._daily_target_met() and self._minutes_until_next_day() > DAILY_EARLY_WAKE_MINUTES:
+                if not daily_gate_was_closed:
+                    log(f"Daily profit target (${DAILY_PROFIT_TARGET}) reached (${self.daily_pnl:.2f}) — "
+                        f"waiting for the next UTC day before opening new positions", crypto)
+                    daily_gate_was_closed = True
+                time.sleep(MONITOR_INTERVAL)
+                continue
+            daily_gate_was_closed = False
 
             # TOP PRIORITY, unconditional: stop opening NEW positions once the
             # projected total (realized + potential from open positions) hits
@@ -1178,6 +1246,32 @@ class HourlyBot:
         log(f"Window closed. Trades opened this window: {trades_this_window} | "
             f"Realized pnl: {'+' if realized>=0 else ''}${realized:.2f}"
             + (f" | {n_open} position(s) still resolving (potential +${potential:.2f})" if n_open else ""), crypto)
+
+    def _check_daily_reset(self):
+        """Resets daily_pnl if the UTC calendar day has changed since we
+        last checked. Days always align exactly with hourly window
+        boundaries, so this check happening once per window is sufficient —
+        there's no way for a day to change mid-window."""
+        today = datetime.now(timezone.utc).date()
+        with self.daily_lock:
+            if self.current_day != today:
+                if self.current_day is not None:
+                    log(f"New UTC day — resetting daily profit tracker (was ${self.daily_pnl:.2f})")
+                self.current_day = today
+                self.daily_pnl = 0.0
+
+    def _update_daily_pnl(self, amount: float):
+        with self.daily_lock:
+            self.daily_pnl += amount
+
+    def _daily_target_met(self) -> bool:
+        with self.daily_lock:
+            return self.daily_pnl >= DAILY_PROFIT_TARGET
+
+    def _minutes_until_next_day(self) -> float:
+        now = now_unix()
+        next_midnight = ((int(now) // 86400) + 1) * 86400
+        return (next_midnight - now) / 60
 
     def _record(self, row: dict):
         with self.trades_lock:
